@@ -1,36 +1,81 @@
-"""Ordered event log. The causal check in scenarios.py reads this log, so a
-finding is never based on "a test failed" alone."""
+"""Ordered events used as the only source of truth for causal verdicts.
+
+Every HTTP attempt receives an explicit ``attempt_id``. Events that describe
+work performed by that attempt carry the same identifier, which lets the
+verifier prove that a commit belongs to the retry rather than to an unrelated
+request.
+"""
 
 from __future__ import annotations
 
-import itertools
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
+
+
+class EventKind(str, Enum):
+    """Event types emitted by the reference client/server and fault adapter."""
+
+    REQUEST_SENT = "request_sent"
+    REQUEST_RECEIVED = "request_received"
+    SIDE_EFFECT_COMMITTED = "side_effect_committed"
+    RESPONSE_DROPPED = "response_dropped"
+    RESPONSE_RETURNED = "response_returned"
+    IDEMPOTENT_REPLAY = "idempotent_replay"
+    SCENARIO_END = "scenario_end"
 
 
 @dataclass(frozen=True)
 class Event:
+    """A single immutable event with a monotonic sequence number."""
+
     seq: int
-    kind: str
-    detail: dict[str, Any] = field(default_factory=dict)
+    kind: EventKind
+    attempt_id: str | None = None
+    operation_id: str | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Accept strings so hand-built fixtures stay readable, but normalise
+        # them to the enum before the verifier sees the event.
+        if not isinstance(self.kind, EventKind):
+            object.__setattr__(self, "kind", EventKind(self.kind))
 
 
 class EventLog:
+    """Append-only log that assigns strictly increasing sequence numbers."""
+
     def __init__(self) -> None:
         self._events: list[Event] = []
-        self._counter = itertools.count(1)
+        self._next_seq = 1
 
-    def record(self, kind: str, **detail: Any) -> Event:
-        event = Event(next(self._counter), kind, detail)
+    def record(
+        self,
+        kind: EventKind,
+        *,
+        attempt_id: str | None = None,
+        operation_id: str | None = None,
+        **data: Any,
+    ) -> Event:
+        """Append an event and return it.
+
+        Sequence numbers are allocated by the log, never by callers, so two
+        events can not silently share a position in the trace.
+        """
+
+        event = Event(
+            seq=self._next_seq,
+            kind=kind,
+            attempt_id=attempt_id,
+            operation_id=operation_id,
+            data=dict(data),
+        )
+        self._next_seq += 1
         self._events.append(event)
         return event
 
     @property
-    def events(self) -> list[Event]:
-        return list(self._events)
+    def events(self) -> tuple[Event, ...]:
+        """Return an immutable snapshot of the recorded events."""
 
-    def kinds(self) -> list[str]:
-        return [e.kind for e in self._events]
-
-    def count(self, kind: str) -> int:
-        return sum(1 for e in self._events if e.kind == kind)
+        return tuple(self._events)
