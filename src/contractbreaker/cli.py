@@ -7,6 +7,15 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .benchmark import (
+    EXIT_BENCHMARK_ERROR,
+    BenchmarkDatasetError,
+    benchmark_exit_code,
+    benchmark_report_to_json,
+    render_benchmark_text,
+    run_benchmark,
+    write_benchmark_report,
+)
 from .pipeline import (
     SUPPORTED_SCENARIOS,
     SUPPORTED_SERVER_IDEMPOTENCY,
@@ -25,13 +34,22 @@ from .report import (
 )
 from .version import __version__
 
-_EXIT_EPILOG = """exit codes:
+_ANALYZE_EPILOG = """analyze exit codes:
   0  analysis completed: not_reproduced
   1  analysis completed: confirmed
   2  analysis completed: inconclusive or not runnable
   3  invalid CLI arguments
   4  unsupported/invalid input or report write failure
 """
+
+_BENCHMARK_EPILOG = """benchmark exit codes:
+  0  benchmark completed with all labeled cases matched
+  1  benchmark completed with one or more mismatches
+  2  benchmark dataset or execution could not be completed
+  3  invalid CLI arguments
+"""
+
+_TOP_LEVEL_EPILOG = _BENCHMARK_EPILOG + "\n\n" + _ANALYZE_EPILOG
 
 
 class _Parser(argparse.ArgumentParser):
@@ -60,10 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="contractbreaker",
         description=(
-            "Extract supported retry/timeout facts, derive a deterministic "
-            "hypothesis, run one reference scenario, and report the causal verdict."
+            "Extract supported retry/timeout facts, run a deterministic "
+            "runtime scenario for a supported analyzed client, and report the "
+            "causal verdict. The benchmark subcommand scores labeled datasets."
         ),
-        epilog=_EXIT_EPILOG,
+        epilog=_TOP_LEVEL_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -80,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
             "executed in an isolated subprocess against an in-process test "
             "service; unsupported sources are not substituted."
         ),
-        epilog=_EXIT_EPILOG,
+        epilog=_ANALYZE_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     analyze_parser.add_argument(
@@ -144,6 +163,37 @@ def build_parser() -> argparse.ArgumentParser:
             "(default: 10)"
         ),
     )
+
+    benchmark_parser = subparsers.add_parser(
+        "benchmark",
+        help="run a labeled development/held-out benchmark dataset",
+        description=(
+            "Run every labeled benchmark case through the normal analysis "
+            "pipeline. Expected labels are used only for scoring."
+        ),
+        epilog=_BENCHMARK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    benchmark_parser.add_argument(
+        "--dataset",
+        required=True,
+        type=Path,
+        help=(
+            "dataset root containing development/manifest.json and "
+            "held_out/manifest.json"
+        ),
+    )
+    benchmark_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="stdout format (default: text)",
+    )
+    benchmark_parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the benchmark JSON report to this file as well",
+    )
     return parser
 
 
@@ -153,6 +203,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "benchmark":
+        return _run_benchmark_command(args)
     if args.command != "analyze":
         parser.error("a command is required")
 
@@ -201,3 +253,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(render_text(report))
 
     return exit_code_for_report(report)
+
+
+def _run_benchmark_command(args: argparse.Namespace) -> int:
+    try:
+        report = run_benchmark(args.dataset)
+    except BenchmarkDatasetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_BENCHMARK_ERROR
+
+    if args.output is not None:
+        try:
+            write_benchmark_report(report, args.output)
+        except OSError as exc:
+            print(
+                f"error: could not write benchmark report to {args.output}: {exc}",
+                file=sys.stderr,
+            )
+            return EXIT_BENCHMARK_ERROR
+
+    if args.format == "json":
+        sys.stdout.write(benchmark_report_to_json(report))
+    else:
+        print(render_benchmark_text(report))
+
+    return benchmark_exit_code(report)
