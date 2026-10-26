@@ -83,6 +83,7 @@ class HeaderFact:
     name: Fact[str]
     value: Fact[str]
     location: SourceLocation
+    conditional: bool = False
 
 
 @dataclass(frozen=True)

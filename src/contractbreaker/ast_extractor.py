@@ -99,6 +99,7 @@ class _ParsedHeader:
     name: str
     value_node: ast.AST
     location: SourceLocation
+    conditional: bool = False
 
 
 def extract_from_file(path: str | Path) -> ExtractionResult:
@@ -134,6 +135,7 @@ def extract_from_source(source: str, *, filename: str = "<string>") -> Extractio
     index = _NameIndex(tree, parents)
     aliases, warnings = _collect_aliases(tree, filename)
     session_names = _collect_session_names(tree, aliases)
+    session_names.update(_collect_injected_session_names(tree, aliases))
     session_header_mutations = _collect_session_header_mutations(tree)
 
     raw_calls: list[_RawCall] = []
@@ -281,6 +283,21 @@ class _NameIndex:
             )
         records.sort(key=_position)
         return records
+
+    def is_conditional(self, node: ast.AST) -> bool:
+        """Return whether a statement sits behind a branch or exception path."""
+
+        current = self._parents.get(id(node))
+        while current is not None:
+            if isinstance(
+                current,
+                (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda),
+            ):
+                return False
+            if isinstance(current, (ast.If, ast.IfExp, ast.Try, ast.Match)):
+                return True
+            current = self._parents.get(id(current))
+        return False
 
 
 def _assignment_targets(node: ast.Assign | ast.AnnAssign) -> list[ast.AST]:
@@ -460,6 +477,51 @@ def _header_owner(node: ast.AST) -> str | None:
     return None
 
 
+def _collect_injected_session_names(tree: ast.AST, aliases: _Aliases) -> set[str]:
+    """Track session objects injected through annotated ``requests.Session``."""
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        arguments = (
+            list(node.args.posonlyargs)
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        annotated = {
+            argument.arg
+            for argument in arguments
+            if _is_session_annotation(argument.annotation, aliases)
+        }
+        if not annotated:
+            continue
+        for child in _iter_execution_scope(node):
+            if not isinstance(child, (ast.Assign, ast.AnnAssign)):
+                continue
+            if isinstance(child, ast.AnnAssign) and _is_session_annotation(
+                child.annotation, aliases
+            ):
+                text = _qualified_name(child.target)
+                if text is not None:
+                    names.add(text)
+            if isinstance(child.value, ast.Name) and child.value.id in annotated:
+                for target in _assignment_targets(child):
+                    text = _qualified_name(target)
+                    if text is not None:
+                        names.add(text)
+    return names
+
+
+def _is_session_annotation(annotation: ast.AST | None, aliases: _Aliases) -> bool:
+    if annotation is None:
+        return False
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value in aliases.session_constructors
+    name = _qualified_name(annotation)
+    return name in aliases.session_constructors
+
+
 def _collect_session_names(tree: ast.AST, aliases: _Aliases) -> set[str]:
     names: set[str] = set()
     for node in ast.walk(tree):
@@ -611,6 +673,7 @@ def _build_call_fact(
             name=Fact.known(header.name),
             value=_header_value_fact(header.value_node),
             location=header.location,
+            conditional=header.conditional,
         )
         for header in parsed_headers
     )
@@ -789,7 +852,11 @@ def _resolve_header_variable(
             if direct is not None:
                 value = operation.value
                 if isinstance(value, ast.Dict):
-                    parsed, complete = _parse_header_dict(value, filename)
+                    parsed, complete = _parse_header_dict(
+                        value,
+                        filename,
+                        conditional=index.is_conditional(operation),
+                    )
                     reason = (
                         None if complete else "headers contain dynamic or ** entries"
                     )
@@ -815,6 +882,7 @@ def _resolve_header_variable(
                             header_name,
                             operation.value,
                             _location(filename, key),
+                            conditional=index.is_conditional(operation),
                         ),
                     )
                 continue
@@ -827,7 +895,9 @@ def _resolve_header_variable(
             call = operation.value
             if len(call.args) == 1 and isinstance(call.args[0], ast.Dict):
                 updates, updates_complete = _parse_header_dict(
-                    call.args[0], filename
+                    call.args[0],
+                    filename,
+                    conditional=index.is_conditional(operation),
                 )
                 if complete:
                     for update in updates:
@@ -851,7 +921,7 @@ def _set_header(headers: list[_ParsedHeader], header: _ParsedHeader) -> None:
 
 
 def _parse_header_dict(
-    node: ast.Dict, filename: str
+    node: ast.Dict, filename: str, *, conditional: bool = False
 ) -> tuple[list[_ParsedHeader], bool]:
     parsed: list[_ParsedHeader] = []
     complete = True
@@ -865,7 +935,12 @@ def _parse_header_dict(
             continue
         _set_header(
             parsed,
-            _ParsedHeader(name, value, _location(filename, key)),
+            _ParsedHeader(
+                name,
+                value,
+                _location(filename, key),
+                conditional=conditional,
+            ),
         )
     return parsed, complete
 
@@ -889,6 +964,10 @@ def _extract_idempotency(
             return Fact.absent("no Idempotency-Key header found")
         return Fact.unknown(
             headers_reason or "headers could not be resolved, so key presence is unknown"
+        )
+    if key_header.conditional:
+        return Fact.ambiguous(
+            "Idempotency-Key is set conditionally; presence depends on runtime state"
         )
 
     origin, assignment = _resolve_origin(key_header.value_node, index)
