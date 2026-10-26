@@ -33,6 +33,7 @@ from .report import (
     report_to_json,
     write_report,
 )
+from .dashboard.server import serve as serve_dashboard
 from .version import __version__
 from .workflow import (
     SUPPORTED_WORKFLOW_SCENARIOS,
@@ -57,6 +58,12 @@ _BENCHMARK_EPILOG = """benchmark exit codes:
   3  invalid CLI arguments
 """
 
+_DASHBOARD_EPILOG = """dashboard exit codes:
+  0  dashboard server stopped normally
+  2  dashboard server could not start
+  3  invalid CLI arguments
+"""
+
 _WORKFLOW_EPILOG = """workflow exit codes:
   0  executed; runtime verdict not_reproduced
   1  executed; runtime verdict confirmed
@@ -66,7 +73,13 @@ _WORKFLOW_EPILOG = """workflow exit codes:
 """
 
 _TOP_LEVEL_EPILOG = (
-    _WORKFLOW_EPILOG + "\n\n" + _BENCHMARK_EPILOG + "\n\n" + _ANALYZE_EPILOG
+    _DASHBOARD_EPILOG
+    + "\n\n"
+    + _WORKFLOW_EPILOG
+    + "\n\n"
+    + _BENCHMARK_EPILOG
+    + "\n\n"
+    + _ANALYZE_EPILOG
 )
 
 
@@ -317,6 +330,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="maximum seconds for isolated client execution (default: 10)",
     )
+
+    dashboard_parser = subparsers.add_parser(
+        "dashboard",
+        help="serve the ContractBreaker developer dashboard",
+        description=(
+            "Serve a local developer dashboard that drives the existing "
+            "ContractBreaker workflow. The browser never receives API keys "
+            "and never executes analyzed code."
+        ),
+        epilog=_DASHBOARD_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    dashboard_parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path("."),
+        help="directory the dashboard may analyze Python files from (default: .)",
+    )
+    dashboard_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind (default: 127.0.0.1, loopback only)",
+    )
+    dashboard_parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="port to bind (default: 8765)",
+    )
     return parser
 
 
@@ -326,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.command == "dashboard":
+        return _run_dashboard_command(args)
     if args.command == "benchmark":
         return _run_benchmark_command(args)
     if args.command == "workflow":
@@ -406,6 +450,22 @@ def _run_benchmark_command(args: argparse.Namespace) -> int:
         print(render_benchmark_text(report))
 
     return benchmark_exit_code(report)
+
+def _run_dashboard_command(args: argparse.Namespace) -> int:
+    if args.port < 1 or args.port > 65535:
+        print("error: --port must be between 1 and 65535", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    root = args.root.resolve()
+    if not root.is_dir():
+        print(f"error: --root is not a directory: {root}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+    try:
+        serve_dashboard(root, host=args.host, port=args.port)
+    except OSError as exc:
+        print(f"error: could not start dashboard server: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
 
 def _run_workflow_command(args: argparse.Namespace) -> int:
     if not args.request.strip() and not (args.scenario and args.source):
