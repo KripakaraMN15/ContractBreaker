@@ -1,15 +1,16 @@
-"""ContractBreaker: test-proven detection of retry/timeout conflicts."""
+"""ContractBreaker: deterministic causal verification of retry conflicts."""
 
-from .events import Event, EventLog
-from .harness import FaultInjectingAdapter, FaultPlan
-from .scenarios import Report, Verdict, run_lost_response_scenario
+from .events import Event, EventKind, EventLog
+from .faults import FaultInjectionAdapter, FaultPlan
+from .verifier import Report, Verdict, verify_duplicate_side_effects
 
 __all__ = [
     "Event",
+    "EventKind",
     "EventLog",
-    "FaultInjectingAdapter",
+    "FaultInjectionAdapter",
     "FaultPlan",
     "Report",
     "Verdict",
-    "run_lost_response_scenario",
+    "verify_duplicate_side_effects",
 ]

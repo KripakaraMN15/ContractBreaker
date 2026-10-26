@@ -1,20 +1,51 @@
-"""Milestone-1 demo: duplicate payment reproduced, then fixed, same scenario."""
-from contractbreaker import run_lost_response_scenario
-from examples.payments.client import PaymentClient
-from examples.payments.service import create_app
+"""Milestone-1 demo: reproduce the duplicate, then test each partial fix."""
+
+from examples.payments.scenario import PaymentScenarioConfig, run_payment_scenario
+
+CASES = [
+    (
+        "buggy client + buggy server",
+        PaymentScenarioConfig(
+            server_supports_idempotency=False,
+            client_sends_idempotency_key=False,
+        ),
+    ),
+    (
+        "server-only idempotency",
+        PaymentScenarioConfig(
+            server_supports_idempotency=True,
+            client_sends_idempotency_key=False,
+        ),
+    ),
+    (
+        "idempotency key on both sides",
+        PaymentScenarioConfig(
+            server_supports_idempotency=True,
+            client_sends_idempotency_key=True,
+        ),
+    ),
+]
 
 
-def run(label, server_idempotent, client_key):
-    r = run_lost_response_scenario(
-        make_app=lambda e, l: create_app(e, l, idempotent=server_idempotent),
-        make_client=lambda s: PaymentClient(s, use_idempotency_key=client_key),
-        call=lambda c: c.create_payment(1999),
-    )
-    print(f"\n[{label}] verdict={r.verdict.value}  side_effects={r.side_effects}")
-    print(f"  reason: {r.reason}")
-    print(f"  events: {' -> '.join(r.event_kinds)}")
+def main() -> None:
+    for label, config in CASES:
+        report = run_payment_scenario(config)
+        kinds = " -> ".join(
+            event.kind.value
+            for event in report.events
+            if event.kind.value
+            in {
+                "request_sent",
+                "side_effect_committed",
+                "response_dropped",
+                "idempotent_replay",
+            }
+        )
+        print(f"\n[{label}]")
+        print(f"  verdict={report.verdict.value}  side_effects={report.side_effects}")
+        print(f"  reason: {report.reason}")
+        print(f"  evidence: {kinds}")
 
 
-run("buggy client + buggy server", False, False)
-run("server-only fix           ", True, False)
-run("idempotency key both sides", True, True)
+if __name__ == "__main__":
+    main()
