@@ -26,6 +26,7 @@ from .hypothesis import (
 )
 from .retryable_error_verifier import verify_retryable_error_duplicate
 from .verifier import Report, Verdict, verify_duplicate_side_effects
+from .version import __version__
 
 __all__ = [
     "ClientHypothesis",
@@ -34,9 +35,9 @@ __all__ = [
     "EventLog",
     "ExtractionResult",
     "ExtractionStatus",
-    "ExtractionWarning",
+"ExtractionWarning",
     "Fact",
-"FactStatus",
+    "FactStatus",
     "FaultInjectionAdapter",
     "FaultPlan",
     "HeaderFact",
@@ -48,6 +49,7 @@ __all__ = [
     "ScenarioRecommendation",
     "SourceLocation",
     "Verdict",
+    "__version__",
     "extract_from_file",
     "extract_from_source",
     "hypothesize_from_extraction",
