@@ -15,9 +15,19 @@ from .extraction import (
     SourceLocation,
 )
 from .faults import FaultInjectionAdapter, FaultPlan
+from .hypothesis import (
+    ClientHypothesis,
+    HypothesisNotRunnable,
+    ScenarioRecommendation,
+    hypothesize_from_extraction,
+    hypothesize_from_file,
+    hypothesize_from_source,
+    recommend_scenario,
+)
 from .verifier import Report, Verdict, verify_duplicate_side_effects
 
 __all__ = [
+    "ClientHypothesis",
     "Event",
     "EventKind",
     "EventLog",
@@ -25,17 +35,24 @@ __all__ = [
     "ExtractionStatus",
     "ExtractionWarning",
     "Fact",
-    "FactStatus",
+"FactStatus",
     "FaultInjectionAdapter",
     "FaultPlan",
     "HeaderFact",
     "HttpCallFact",
+    "HypothesisNotRunnable",
     "IdempotencyKeyFact",
     "Report",
     "RetryLoopFact",
+    "ScenarioRecommendation",
     "SourceLocation",
     "Verdict",
     "extract_from_file",
     "extract_from_source",
+    "hypothesize_from_extraction",
+    "hypothesize_from_file",
+    "hypothesize_from_source",
+    "recommend_scenario",
     "verify_duplicate_side_effects",
 ]
+
