@@ -3,10 +3,9 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 4. The build verifies two distinct failure scenarios and
-> exposes the full extraction -> hypothesis -> scenario -> verifier pipeline
-> through a developer CLI with human-readable and JSON reports. Static
-> extraction never issues a verdict.
+> Status: milestone 5. The CLI now executes the analyzed client itself in an
+> isolated subprocess for a narrow supported contract, then applies the existing
+> causal verifier. Static extraction and hypotheses never issue a verdict.
 
 ## The problem
 
@@ -17,18 +16,25 @@ tests can all pass while this happens.
 
 ## How it works
 
-1. The real reference client talks to the real reference server in-process.
-2. `FaultInjectionAdapter` drops the response on a selected attempt **after**
-   the server has finished handling it, so the side effect is committed but the
-   client observes a timeout.
-3. The client retries the same logical operation when allowed.
-4. An append-only event log records requests, server receipt, commits, dropped
-   responses, replays, and the terminal outcome with explicit attempt ids.
-5. The verifier checks the ordered causal chain and reconciles commits with the
-   observable side-effect ledger.
+1. The CLI reads one supported Python client file and extracts retry, timeout,
+   and idempotency facts.
+2. It builds a deterministic hypothesis and checks both scenario readiness and
+   the narrow executable-client contract.
+3. If runnable, a subprocess worker executes the analyzed module against an
+   in-process Flask test service. All `requests` traffic is routed through the
+   harness adapter, socket construction is blocked, and the parent enforces an
+   execution timeout.
+4. The selected scenario simulates either a lost response after a server commit
+   or a configured retryable HTTP error after a commit.
+5. An append-only event log records requests, server receipt, commits, faults,
+   replays, and the terminal outcome with explicit attempt ids.
+6. The existing verifier checks the ordered causal chain and reconciles commits
+   with the observable side-effect ledger.
 
-No sockets, sleeps, or LLM calls are involved. UUIDs identify operations and
-keys, but they do not affect the verdict logic.
+No external network or LLM calls are involved. Faults are deterministic. UUIDs
+identify operations and keys, but they do not affect the verdict logic. The
+bundled reference scenarios remain as programmatic verifier fixtures; the CLI
+does not silently substitute them for the analyzed source.
 
 ## Strict verdict rules
 
@@ -92,6 +98,8 @@ Options:
 - `--scenario auto` selects `lost-response` only when that hypothesis is
   runnable. It does not guess a retryable-error policy; select that scenario
   explicitly.
+- `--execution-timeout SECONDS` limits isolated analyzed-client execution. The
+  default is 10 seconds; a timeout produces a structured non-runnable report.
 
 ### Exit codes
 
@@ -105,6 +113,35 @@ Options:
 
 Inconclusive analysis never exits `0`. `confirmed` is issued only by the
 runtime causal verifier.
+
+### Executable client contract
+
+Runtime execution is deliberately narrower than static extraction:
+
+- Exactly one recognized `requests` call site.
+- The call must execute at module level. It may be inside module-level loops,
+  conditionals, or `try` blocks, but not inside a function, class, or lambda.
+- The call must use `POST` and an endpoint path of exactly `/payments`, matching
+  the bundled test payment service.
+- Allowed imports: `requests`, `uuid`, `json`, `typing`, `dataclasses`,
+  `datetime`, `time`, `secrets`, `base64`, and `hashlib`.
+- Forbidden patterns include adapters/`session.mount`, `open`, `eval`, `exec`,
+  `compile`, dynamic imports, `getattr`, socket/urllib/httpx/aiohttp clients,
+  and file/process modules.
+- The client may be a stable-key or keyless client; conditional keys make the
+  hypothesis ambiguous and non-runnable.
+
+The worker executes the module in a separate Python process with a temporary
+working directory. It routes every `requests` call to an in-process WSGI service
+and replaces `socket.socket`/`socket.create_connection` with blocking guards. It
+assigns `X-Operation-Id` only when the client does not supply one. Source output
+is suppressed. If the source hangs, the parent terminates the worker at the
+configured timeout.
+
+This is isolation for deterministic testing, not a hardened security sandbox.
+The source still runs with the invoking user's privileges. Unsupported or
+unreliable sources are reported as non-runnable; they are never silently
+replaced by the reference client.
 
 ### Report schema
 
@@ -172,27 +209,33 @@ An abridged confirmed report (the full event list is produced by the CLI):
   "scenario_configuration": {
     "executed": true,
     "scenario": "lost-response",
-    "runner": "run_payment_scenario",
+    "runner": "runtime_subprocess",
     "settings": {
+      "entrypoint": "module",
       "server_supports_idempotency": false,
       "client_sends_idempotency_key": false,
       "max_retries": 1,
       "drop_response_on_attempts": [1],
-      "request_timeout": 5.0
+      "request_timeout": 5.0,
+      "execution_timeout_seconds": 10.0,
+      "operation_id_source": "harness_if_absent"
     },
     "provenance": {
+      "entrypoint": "scenario_default",
       "server_supports_idempotency": "derived_from_extraction",
       "client_sends_idempotency_key": "derived_from_extraction",
       "max_retries": "derived_from_extraction",
       "drop_response_on_attempts": "scenario_default",
-      "request_timeout": "derived_from_extraction"
+      "request_timeout": "derived_from_extraction",
+      "execution_timeout_seconds": "scenario_default",
+      "operation_id_source": "scenario_default"
     },
     "reason": null
   },
   "execution": {
     "occurred": true,
     "provenance": "runtime_observation",
-    "runner": "run_payment_scenario",
+    "runner": "runtime_subprocess",
     "events": [
       {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-demo", "data": {"method": "POST", "path": "/payments"}},
       {"seq": 2, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-demo", "data": {"side_effect_id": "effect-1"}},
@@ -209,7 +252,7 @@ An abridged confirmed report (the full event list is produced by the CLI):
   "verdict_reason": "retry after a lost response committed a second side effect (2 side effects for one logical operation)",
   "verdict_provenance": "runtime_verifier",
   "limitations": [
-    "Runtime scenarios execute the bundled reference harness, not the analyzed source file."
+    "The analyzed client is executed in a subprocess against an in-process WSGI test service; this is isolation, not a hardened security sandbox."
   ]
 }
 ```
@@ -306,27 +349,31 @@ resolved. Otherwise `scenario_ready` is false, `blockers` explains why, and
 `recommend_scenario` raises `HypothesisNotRunnable`. Static extraction has no
 verdict field; only the causal verifier can return `confirmed`.
 
-`examples/payments/scenario.py` provides `config_from_hypothesis`, which maps a
-runnable hypothesis onto the existing reference scenario. The end-to-end tests
-extract source, build a hypothesis, construct a scenario config, run the
-scenario, and assert the runtime verdict.
+`examples/payments/scenario.py` still provides `config_from_hypothesis` for
+programmatic reference-scenario tests. The CLI no longer uses that mapping: for
+a runnable hypothesis it executes the analyzed client source itself.
 
 The reference payment client is a deliberate partial example: its injected
-session is now recognized, but its f-string endpoint, `self._timeout`, and
-`self._max_retries` are not literal, and its key is conditional. The hypothesis
-therefore reports the call but refuses to run until those facts are made
-statically explicit.
+session is recognized, but its f-string endpoint, `self._timeout`, and
+`self._max_retries` are not literal; its key is conditional; and its HTTP call
+is inside a method rather than at module level. The hypothesis reports those
+facts and refuses runtime execution until the source satisfies the executable
+client contract.
 
 ## Lost-response payment scenario
 
-`examples/payments` contains a small payment client and Flask service:
+`examples/payments` contains the reference payment fixtures:
 
-- The client retries timeouts and optionally sends a stable
+- The reference client retries timeouts and optionally sends a stable
   `Idempotency-Key` plus a stable `X-Operation-Id`.
 - The service optionally deduplicates known idempotency keys and appends every
   committed payment to a ledger.
 - `examples/payments/scenario.py` wires both sides to the fault adapter and
-  returns a verifier `Report`.
+  returns a verifier `Report` for programmatic tests.
+
+The CLI does not use the reference client. It executes the analyzed module
+against the same test service, with the harness dropping the first response
+after the server commits.
 
 ## Retryable-error scenario
 
@@ -334,8 +381,13 @@ This is a separate scenario from the lost-response case. The server commits the
 side effect first and then returns an HTTP error such as `503`. A client retries
 only because an explicit `RetryPolicy` includes that status.
 
-`examples/payments/retryable_error_scenario.py` runs the scenario and returns a
-verifier `Report`. The trace contains:
+For CLI runtime execution, the worker returns the configured error to the
+analyzed client and records a retry decision only when a subsequent request
+follows that configured status. The policy is never inferred merely from the
+presence of a 503 response.
+
+`examples/payments/retryable_error_scenario.py` remains the programmatic
+reference scenario and returns a verifier `Report`. Its trace contains:
 
 - `retry_policy_configured` with the exact retryable status set and retry budget.
 - `request_sent` and `request_received` per attempt.
@@ -381,12 +433,12 @@ python demo.py
 
 The test suite is deterministic and does not require network access. The
 installation exposes both `contractbreaker` and `python -m contractbreaker`.
-The editable install also packages the bundled reference scenarios so the CLI
-works outside the repository root.
+The editable install also packages the bundled test services so the runtime
+worker works outside the repository root.
 
 ## Tests
 
-The complete suite currently contains 82 tests.
+The complete suite currently contains 98 tests.
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
 
@@ -431,7 +483,7 @@ The complete suite currently contains 82 tests.
 - Retry decision without a retry request, incorrect ordering, mismatched
   attempt ids, and policy mismatch: `inconclusive`.
 
-`tests/test_cli.py` adds 19 CLI/report cases:
+`tests/test_cli.py` adds 20 CLI/report cases:
 
 - Buggy and protected clients for both runtime scenarios.
 - Automatic lost-response selection.
@@ -442,15 +494,38 @@ The complete suite currently contains 82 tests.
 - JSON schema stability, JSON-native serialization, output-file writing, and
   invocation through `python -m contractbreaker` from outside the repository.
 
+`tests/test_runtime_contract.py` adds 7 contract cases:
+
+- Module-level requests clients are supported.
+- Nested calls, disallowed imports, requests adapter imports, forbidden calls,
+  `session.mount`, and files without a recognized call are non-runnable.
+
+`tests/test_runtime_execution.py` adds 8 runtime cases:
+
+- The actual buggy lost-response client confirms and the fixed client does not.
+- The actual buggy retryable-error client confirms and the fixed client does not.
+- A client that does not retry is not falsely confirmed.
+- A nested client is not executed or substituted.
+- An incomplete runtime trace is inconclusive.
+- Execution timeout maps to a structured failure.
+
 ## Known limitations
 
-- **Simulated failures only.** The adapter routes `requests` calls into a Flask
-  test client and raises a `ReadTimeout` after in-process server execution. It
-  does not inject real network-level failures, packet loss, or a real dropped
-  HTTP response. The boundary being modeled is "server committed, client saw a
-  timeout", not an actual socket-level fault.
+- **Simulated failures only.** The analyzed client really executes, but its
+  `requests` traffic is routed into a Flask test client. The adapter raises
+  `ReadTimeout` or returns a configured `503` after in-process server execution.
+  It does not inject real network-level failures, packet loss, or a real dropped
+  HTTP response.
 - **Two runtime scenarios only.** Lost-response and commit-then-retryable-error
   are covered. No other failure modes or retry backoff schedules are modeled.
+- **Executable support is narrow.** Runtime execution requires one module-level
+  `requests` call site, `POST /payments`, and allowlisted imports. Calls inside
+  functions/classes/lambdas, custom adapters, `open`, dynamic imports, and
+  non-requests HTTP clients are non-runnable.
+- **Isolation is not a security sandbox.** The analyzed source runs in a
+  subprocess with the invoking user's privileges. The harness blocks socket
+  construction and routes requests, but it does not provide OS-level sandboxing.
+  Execution is capped by `--execution-timeout` (default 10 seconds).
 - **Narrow AST support.** The extractor handles only explicit requests patterns
   listed above. It does not perform data-flow analysis, trace wrappers across
   files, evaluate arbitrary expressions, follow decorators, or understand
@@ -459,11 +534,13 @@ The complete suite currently contains 82 tests.
 - **Static assumptions.** Retry bounds are interpreted as one HTTP attempt per
   loop iteration; requests before the loop are not counted. Generated key
   stability is reported unknown unless a known fresh-value generator is
-  evaluated inside the loop.
-- **Reference client is not runnable.** Its call is recognized through the
-  annotated injected session, but the endpoint, timeout, and retry limit are
-  instance attributes and the key is conditional. Those facts stay unknown or
-  ambiguous, so the hypothesis correctly refuses to configure a scenario.
+  evaluated inside the loop. Static retry counts and timeouts are expectations
+  recorded for context; the analyzed client's code controls actual runtime
+  attempts and timeouts.
+- **Reference client is not runtime-runnable.** Its call is recognized through
+  the annotated injected session, but the endpoint, timeout, and retry limit are
+  instance attributes, the key is conditional, and the call is inside a method
+  rather than at module level. The hypothesis correctly refuses execution.
 - **Hypothesis scope.** A runnable lost-response hypothesis requires exactly one
   recognized call, a literal positive timeout, a known retry count, an identified
   timeout/connection trigger, and a stable or absent idempotency key.
@@ -472,10 +549,9 @@ The complete suite currently contains 82 tests.
   from CLI flags/defaults, not static extraction. Its verdict depends on the
   configured status set and retry budget; another policy must be modeled
   separately.
-- **The CLI does not execute the analyzed source file.** It derives a
-  hypothesis and configures the bundled reference harness. Runtime files,
-  site-packages, multiple source files, and arbitrary repository layouts are not
-  analyzed.
+- **The CLI analyzes one supplied file.** It does not perform arbitrary
+  repository analysis, multi-file data flow, wrapper resolution, or package
+  discovery.
 - **Reports are scenario evidence, not a security audit.** Unsupported patterns,
   unknown facts, and non-runnable hypotheses are reported as such and can never
   become `confirmed`.
