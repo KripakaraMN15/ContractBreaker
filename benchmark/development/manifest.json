@@ -1,0 +1,326 @@
+{
+  "dataset": "contractbreaker-synthetic",
+  "dataset_version": "1.0",
+  "split": "development",
+  "cases": [
+    {
+      "id": "dev-lost-for-buggy",
+      "source": "dev_lost_for_buggy.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Development pattern: explicit for loop, timeout handler, keyless buggy client."
+    },
+    {
+      "id": "dev-lost-for-fixed",
+      "source": "dev_lost_for_fixed.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Development pattern: stable uuid key generated outside the retry loop."
+    },
+    {
+      "id": "dev-retry-for-buggy",
+      "source": "dev_retry_for_buggy.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Development pattern: literal 503 status check with an agreeing CLI policy."
+    },
+    {
+      "id": "dev-retry-for-fixed",
+      "source": "dev_retry_for_fixed.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Development pattern: agreeing status policy with a stable key."
+    },
+    {
+      "id": "dev-lost-no-retry",
+      "source": "dev_lost_no_retry.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.ConnectionError"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Development pattern: loop catches only ConnectionError, not ReadTimeout."
+    },
+    {
+      "id": "dev-retry-policy-mismatch",
+      "source": "dev_retry_policy_mismatch.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [500],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Development pattern: configured 500 policy does not cover the server's 503."
+    },
+    {
+      "id": "dev-unknown-retry",
+      "source": "dev_unknown_retry.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "unknown", "value": null},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: unresolved max_retries identifier."
+    },
+    {
+      "id": "dev-unknown-timeout",
+      "source": "dev_unknown_timeout.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "unknown", "value": null},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: timeout supplied through an identifier."
+    },
+    {
+      "id": "dev-fresh-key",
+      "source": "dev_fresh_key.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": false}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: fresh uuid key generated inside every attempt."
+    },
+    {
+      "id": "dev-conditional-key",
+      "source": "dev_conditional_key.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "ambiguous", "value": null},
+          "idempotency_key_reused": {"status": "unknown", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: conditional idempotency header mutation."
+    },
+    {
+      "id": "dev-nested-wrapper",
+      "source": "dev_nested_wrapper.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: recognized call is inside a wrapper function."
+    },
+    {
+      "id": "dev-unsupported-httpx",
+      "source": "dev_unsupported_httpx.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "unsupported",
+        "facts": {},
+        "warning_codes": ["unsupported.http_client", "unsupported.http_call"],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Development pattern: unsupported httpx client must not execute."
+    },
+    {
+      "id": "dev-lost-range1-inconclusive",
+      "source": "dev_lost_range1_inconclusive.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 0},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "inconclusive",
+        "side_effects": 1
+      },
+      "notes": "Moved from held-out during label clarification: one-iteration loop catches the timeout, completes without retrying, and the verifier conservatively returns inconclusive. No detector change."
+    }
+  ]
+}

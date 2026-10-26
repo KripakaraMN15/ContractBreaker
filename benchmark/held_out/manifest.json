@@ -1,0 +1,259 @@
+{
+  "dataset": "contractbreaker-synthetic",
+  "dataset_version": "1.0",
+  "split": "held_out",
+  "cases": [
+    {
+      "id": "held-lost-while-buggy",
+      "source": "held_lost_while_buggy.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": ["unsupported.retry_loop"],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: while-loop retry is explicitly unsupported."
+    },
+    {
+      "id": "held-lost-retry-wrapper",
+      "source": "held_lost_retry_wrapper.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: retry wrapper function is not module-level executable."
+    },
+    {
+      "id": "held-lost-range3-fixed",
+      "source": "held_lost_range3_fixed.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 2.5},
+          "retry_count": {"status": "known", "value": 2},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Held-out pattern: three-attempt loop, secrets key, float timeout."
+    },
+    {
+      "id": "held-retry-ge500-buggy",
+      "source": "held_retry_ge500_buggy.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 3},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Held-out pattern: retries every >=500 response under an agreeing policy."
+    },
+    {
+      "id": "held-retry-ge500-fixed",
+      "source": "held_retry_ge500_fixed.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 3},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Held-out pattern: >=500 retry with a stable key and agreeing policy."
+    },
+    {
+      "id": "held-retry-policy-disagree",
+      "source": "held_retry_policy_disagree.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Held-out pattern: client retries 500 while the configured policy is 503."
+    },
+    {
+      "id": "held-retry-fresh-key",
+      "source": "held_retry_fresh_key.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": false}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: fresh key per attempt is not a safe retry key."
+    },
+    {
+      "id": "held-timeout-zero",
+      "source": "held_timeout_zero.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 0},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: zero timeout is known but not a positive timeout."
+    },
+    {
+      "id": "held-unsupported-tenacity",
+      "source": "held_unsupported_tenacity.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": ["unsupported.retry_library", "unsupported.retry_decorator"],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: tenacity policy is explicitly unsupported."
+    },
+    {
+      "id": "held-parse-error",
+      "source": "held_parse_error.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "parse_error",
+        "facts": {},
+        "warning_codes": ["parse_error"],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Held-out pattern: syntax errors must not execute."
+    }
+  ]
+}
