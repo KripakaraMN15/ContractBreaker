@@ -3,11 +3,10 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 3. The build verifies two distinct failure scenarios:
-> lost response after commit, and commit followed by a retryable HTTP error.
-> It also extracts narrow client retry/timeout facts and derives deterministic
-> hypotheses for the lost-response scenario. Static extraction never issues a
-> verdict.
+> Status: milestone 4. The build verifies two distinct failure scenarios and
+> exposes the full extraction -> hypothesis -> scenario -> verifier pipeline
+> through a developer CLI with human-readable and JSON reports. Static
+> extraction never issues a verdict.
 
 ## The problem
 
@@ -55,6 +54,167 @@ must equal the observed ledger count.
 
 A passing scenario is evidence about this scenario only. It is **not** proof of
 general production safety.
+
+## CLI
+
+After installation, the `contractbreaker` command and
+`python -m contractbreaker` expose the same pipeline. The CLI analyzes **one
+supported Python client file**; it does not claim to analyze arbitrary Python
+repositories.
+
+```bash
+# Reproduce or clear the lost-response scenario.
+contractbreaker analyze path/to/client.py --scenario lost-response
+
+# Run the configured retryable-error policy.
+contractbreaker analyze path/to/client.py --scenario retryable-error --retry-status 503
+
+# Automatic selection (currently lost-response only).
+contractbreaker analyze path/to/client.py --scenario auto --format json
+
+# Save the JSON report while keeping human-readable stdout.
+contractbreaker analyze path/to/client.py --scenario lost-response --output report.json
+```
+
+Options:
+
+- `--format text|json` selects stdout format. JSON is written to stdout when
+  selected.
+- `--output PATH` always writes the JSON report to that file, regardless of
+  stdout format.
+- `--server-idempotency auto|on|off` controls the runtime server. `auto` derives
+  the setting from the analyzed client's stable-key facts.
+- `--retry-status CODE` is repeatable and only valid with
+  `--scenario retryable-error`. The default is `503`, recorded with
+  `cli_default` provenance.
+- `--server-error-status CODE` is the status returned by the retryable-error
+  scenario server. The default is `503`.
+- `--scenario auto` selects `lost-response` only when that hypothesis is
+  runnable. It does not guess a retryable-error policy; select that scenario
+  explicitly.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Analysis completed with `not_reproduced`. |
+| `1` | Analysis completed with `confirmed`. |
+| `2` | Analysis was inconclusive or the scenario was not runnable. |
+| `3` | Invalid CLI arguments or invalid argument combinations. |
+| `4` | Unsupported/invalid source input or report write failure. |
+
+Inconclusive analysis never exits `0`. `confirmed` is issued only by the
+runtime causal verifier.
+
+### Report schema
+
+Reports use `schema_version = "1.0"` and contain:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version`, `tool_version` | Report/package versions. |
+| `analysis_status` | `executed`, `not_runnable`, or `unsupported_input`. |
+| `scenario` | Requested scenario. |
+| `selected_scenario` | Scenario actually selected, or `null`. |
+| `source_file` | Analyzed file path. |
+| `extraction` | AST facts, locations, statuses, warnings; provenance `static_extraction`. |
+| `hypothesis` | Derived facts, unknowns, blockers, warnings, and scenario readiness; provenance `derived_from_extraction`. |
+| `scenario_configuration` | Effective settings, runner, execution state, and per-setting provenance. |
+| `execution` | Runtime event trace, attempt/operation/side-effect IDs, and observed count; provenance `runtime_observation`. |
+| `verdict`, `verdict_reason` | Final runtime verdict and evidence reason. |
+| `verdict_provenance` | `runtime_verifier` or `not_executed`. |
+| `limitations` | Scope and simulation caveats. |
+
+Provenance values distinguish static facts from other origins:
+`static_extraction`, `derived_from_extraction`, `cli`, `cli_default`,
+`scenario_default`, `runtime_observation`, `runtime_verifier`, and
+`not_executed`.
+
+An abridged confirmed report (the full event list is produced by the CLI):
+
+```json
+{
+  "schema_version": "1.0",
+  "tool_version": "0.1.0",
+  "analysis_status": "executed",
+  "scenario": "lost-response",
+  "selected_scenario": "lost-response",
+  "source_file": "client.py",
+  "extraction": {
+    "status": "supported",
+    "provenance": "static_extraction",
+    "warnings": [],
+    "calls": [
+      {
+        "location": {"file": "client.py", "line": 3, "column": 9, "end_line": 9, "end_column": 10},
+        "method": {"status": "known", "value": "POST", "reason": null},
+        "endpoint": {"status": "known", "value": "http://service.test/payments", "reason": null},
+        "timeout": {"status": "known", "value": 5, "reason": null},
+        "idempotency_key": {"status": "absent", "value": null, "reason": "no Idempotency-Key header found"}
+      }
+    ],
+    "retry_loops": [
+      {
+        "location": {"file": "client.py", "line": 2, "column": 1, "end_line": 10, "end_column": 20},
+        "max_attempts": {"status": "known", "value": 2, "reason": "range(2) iterations"},
+        "retry_count": {"status": "known", "value": 1, "reason": "derived as max_attempts - 1"},
+        "triggers": {"status": "known", "value": ["requests.exceptions.Timeout"], "reason": null}
+      }
+    ]
+  },
+  "hypothesis": {
+    "provenance": "derived_from_extraction",
+    "unknowns": [],
+    "warnings": [],
+    "idempotency_key_present": {"status": "absent", "value": null, "reason": "no Idempotency-Key header found"},
+    "scenario_readiness": {"scenario": "lost-response", "runnable": true, "blockers": [], "unknowns": []}
+  },
+  "scenario_configuration": {
+    "executed": true,
+    "scenario": "lost-response",
+    "runner": "run_payment_scenario",
+    "settings": {
+      "server_supports_idempotency": false,
+      "client_sends_idempotency_key": false,
+      "max_retries": 1,
+      "drop_response_on_attempts": [1],
+      "request_timeout": 5.0
+    },
+    "provenance": {
+      "server_supports_idempotency": "derived_from_extraction",
+      "client_sends_idempotency_key": "derived_from_extraction",
+      "max_retries": "derived_from_extraction",
+      "drop_response_on_attempts": "scenario_default",
+      "request_timeout": "derived_from_extraction"
+    },
+    "reason": null
+  },
+  "execution": {
+    "occurred": true,
+    "provenance": "runtime_observation",
+    "runner": "run_payment_scenario",
+    "events": [
+      {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-demo", "data": {"method": "POST", "path": "/payments"}},
+      {"seq": 2, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-demo", "data": {"side_effect_id": "effect-1"}},
+      {"seq": 3, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-demo", "data": {"status_code": 201}},
+      {"seq": 4, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-demo", "data": {"method": "POST", "path": "/payments"}},
+      {"seq": 5, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-demo", "data": {"side_effect_id": "effect-2"}}
+    ],
+    "attempt_ids": ["attempt-1", "attempt-2"],
+    "operation_ids": ["op-demo"],
+    "side_effect_ids": ["effect-1", "effect-2"],
+    "observed_side_effects": 2
+  },
+  "verdict": "confirmed",
+  "verdict_reason": "retry after a lost response committed a second side effect (2 side effects for one logical operation)",
+  "verdict_provenance": "runtime_verifier",
+  "limitations": [
+    "Runtime scenarios execute the bundled reference harness, not the analyzed source file."
+  ]
+}
+```
+
+JSON output is sorted deterministically and contains only JSON-native values.
 
 ## AST extraction
 
@@ -219,9 +379,14 @@ python -m pytest -q
 python demo.py
 ```
 
-The test suite is deterministic and does not require network access.
+The test suite is deterministic and does not require network access. The
+installation exposes both `contractbreaker` and `python -m contractbreaker`.
+The editable install also packages the bundled reference scenarios so the CLI
+works outside the repository root.
 
 ## Tests
+
+The complete suite currently contains 82 tests.
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
 
@@ -266,6 +431,17 @@ The test suite is deterministic and does not require network access.
 - Retry decision without a retry request, incorrect ordering, mismatched
   attempt ids, and policy mismatch: `inconclusive`.
 
+`tests/test_cli.py` adds 19 CLI/report cases:
+
+- Buggy and protected clients for both runtime scenarios.
+- Automatic lost-response selection.
+- Unknown retry limit and unknown timeout produce inconclusive exit `2`.
+- Unsupported clients and ambiguous idempotency keys never become confirmed.
+- Invalid scenarios and invalid argument combinations exit `3`.
+- Missing files and output-write failures exit `4`.
+- JSON schema stability, JSON-native serialization, output-file writing, and
+  invocation through `python -m contractbreaker` from outside the repository.
+
 ## Known limitations
 
 - **Simulated failures only.** The adapter routes `requests` calls into a Flask
@@ -288,13 +464,21 @@ The test suite is deterministic and does not require network access.
   annotated injected session, but the endpoint, timeout, and retry limit are
   instance attributes and the key is conditional. Those facts stay unknown or
   ambiguous, so the hypothesis correctly refuses to configure a scenario.
-- **Hypothesis scope.** A runnable hypothesis requires exactly one recognized
-  call, a literal positive timeout, a known retry count, an identified
-  timeout/connection trigger, and a stable or absent idempotency key. Hypothesis
-  mapping currently targets the lost-response scenario.
-- **Retryable-error scenario is configured explicitly.** It is not derived from
-  static extraction. Its verdict depends on the exact configured status set and
-  retry budget; another client or policy must be modeled separately.
+- **Hypothesis scope.** A runnable lost-response hypothesis requires exactly one
+  recognized call, a literal positive timeout, a known retry count, an identified
+  timeout/connection trigger, and a stable or absent idempotency key.
+  `--scenario auto` currently selects only the lost-response scenario.
+- **Retryable-error scenario is configured explicitly.** Its status policy comes
+  from CLI flags/defaults, not static extraction. Its verdict depends on the
+  configured status set and retry budget; another policy must be modeled
+  separately.
+- **The CLI does not execute the analyzed source file.** It derives a
+  hypothesis and configures the bundled reference harness. Runtime files,
+  site-packages, multiple source files, and arbitrary repository layouts are not
+  analyzed.
+- **Reports are scenario evidence, not a security audit.** Unsupported patterns,
+  unknown facts, and non-runnable hypotheses are reported as such and can never
+  become `confirmed`.
 - **Not a safety proof.** A `not_reproduced` verdict says this deterministic
   scenario did not produce the duplicate; it does not prove the guard is
   correct for every payload, key scope, or deployment topology.
