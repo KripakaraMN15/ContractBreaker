@@ -12,8 +12,12 @@ dependencies = ["requests>=2.31", "flask>=3.0"]
 [project.optional-dependencies]
 dev = ["pytest>=8"]
 
+[project.scripts]
+contractbreaker = "contractbreaker.cli:main"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["contractbreaker*", "examples*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
