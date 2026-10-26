@@ -76,8 +76,9 @@ def build_parser() -> argparse.ArgumentParser:
         "analyze",
         help="analyze one Python client source file",
         description=(
-            "Analyze one supported requests client. The runtime scenario uses "
-            "the bundled reference harness, not the analyzed file."
+            "Analyze one supported requests client. A runnable client is "
+            "executed in an isolated subprocess against an in-process test "
+            "service; unsupported sources are not substituted."
         ),
         epilog=_EXIT_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -134,6 +135,15 @@ def build_parser() -> argparse.ArgumentParser:
             "scenario (default: 503)"
         ),
     )
+    analyze_parser.add_argument(
+        "--execution-timeout",
+        type=float,
+        default=None,
+        help=(
+            "maximum seconds for isolated analyzed-client execution "
+            "(default: 10)"
+        ),
+    )
     return parser
 
 
@@ -165,6 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     else None
                 ),
                 server_error_status=args.server_error_status,
+                execution_timeout=args.execution_timeout,
             )
         )
     except SourceReadError as exc:
