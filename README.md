@@ -447,6 +447,86 @@ is inside a method rather than at module level. The hypothesis reports those
 facts and refuses runtime execution until the source satisfies the executable
 client contract.
 
+## Dashboard (milestone 8)
+
+`contractbreaker dashboard` serves a local developer UI that drives the same
+workflow the CLI uses. The browser never receives API keys, never runs analyzed
+code, and never fabricates evidence: it renders exactly what the backend
+returns.
+
+```bash
+# Serve the dashboard for a source root (loopback only by default).
+contractbreaker dashboard --root path/to/project --port 8765
+
+# Then open http://127.0.0.1:8765
+```
+
+Environment variables:
+
+- `OPENAI_API_KEY` ? optional. Enables the server-side LLM fallback. The
+  browser never receives it; the toggle is disabled in the UI when the server
+  has no credentials.
+- `CONTRACTBREAKER_LLM_MODEL` ? optional model override (default
+  `gpt-4.1-mini`).
+
+No other configuration is required, and no state is persisted between runs.
+
+### Architecture
+
+```text
+browser (static HTML/CSS/JS)
+   |  JSON over loopback HTTP
+   v
+contractbreaker.dashboard.server   stdlib http.server, static assets + routes
+   |
+   v
+contractbreaker.dashboard.api      validation, approval tokens, path safety
+   |
+   v
+contractbreaker.workflow            existing workflow (plan / approve / execute)
+   |
+   v
+existing pipeline, runtime, verifiers
+```
+
+The API is a thin adapter. It does not reimplement extraction, readiness
+validation, scenario selection, runtime execution, or verdict logic.
+
+| Route | Method | Purpose |
+| --- | --- | --- |
+| `/api/health` | GET | Non-sensitive service metadata. |
+| `/api/sources` | GET | Python files under the allowed root. |
+| `/api/plan` | POST | Read-only plan. Never executes the client. |
+| `/api/execute` | POST | Executes a previously approved plan. |
+
+### Safety properties
+
+- **Plan-only never executes.** `/api/plan` always runs the workflow with
+  `plan_only=True` and returns no runtime evidence.
+- **Approval is enforced server-side.** `/api/execute` requires a
+  server-issued `approval_token` and an explicit `approved: true`. The token is
+  bound to the exact request, source, scenario, and constraints, and is
+  consumed on use, so a replayed or duplicated submission returns `409`
+  instead of executing twice.
+- **Readiness is re-validated on the server.** The execute path re-runs
+  preparation and refuses to execute a client that is no longer runnable. A
+  disabled button in the UI is not treated as a security boundary.
+- **Paths are constrained.** Sources must resolve inside the allowed root, must
+  be `.py` files, and must exist. No shell command is ever built from user
+  input.
+- **No secrets reach the browser.** API keys stay in the server process. The
+  health payload exposes only the API schema version, the allowed root, and
+  whether LLM fallback is available.
+- **Errors stay generic.** Unexpected failures return a code and message
+  without stack traces or environment data.
+
+### UI states
+
+The interface renders distinct, non-color-only states for loading, empty,
+ready, blocked, executed (confirmed / not reproduced / inconclusive), and
+error. The causal timeline renders only events actually present in the
+returned trace; expected-but-missing events stay missing.
+
 ## LLM extraction fallback (milestone 6B)
 
 The optional fallback helps interpret unresolved retry, timeout, and
@@ -734,6 +814,20 @@ live OpenAI smoke test is skipped by default.
 - LLM-disabled workflows never construct an LLM client.
 - Workflow JSON is JSON-native and never embeds the analyzed source text.
 
+`tests/test_dashboard.py` adds 28 backend and HTTP tests:
+
+- Plan-only responses never contain runtime evidence.
+- Blocked and nested clients are never executable.
+- Approval tokens are required, single-use, and rejected when replayed.
+- Readiness is re-validated on the server, independently of client state.
+- Path traversal, out-of-root paths, non-Python files, and missing files are
+  rejected.
+- Invalid scenarios, constraints, and oversized requests are rejected.
+- Health, plan, and execute responses never expose API keys or environment
+  variables.
+- The HTTP layer serves the UI assets, blocks asset traversal, rejects
+  malformed bodies, and completes a plan-then-execute cycle.
+
 `tests/test_llm_live.py` is skipped unless `CONTRACTBREAKER_LIVE_LLM=1` and
 credentials are present.
 
@@ -998,5 +1092,11 @@ or generalization beyond this synthetic dataset.
 - **Not a safety proof.** A `not_reproduced` verdict says this deterministic
   scenario did not produce the duplicate; it does not prove the guard is
   correct for every payload, key scope, or deployment topology.
-- **Not implemented yet:** dashboard and Alan integration; no multi-agent or
-  autonomous LLM extraction framework is present.
+- **The dashboard is a local developer tool.** It binds to loopback by
+  default, has no authentication, and is not hardened for exposure on a shared
+  network. Do not bind it to a public interface without adding access control.
+- **The dashboard does not persist history.** There is no database, no
+  investigation store, and no uploaded-file retention. A plan's approval token
+  lives in server memory only and is lost when the server restarts.
+- **Not implemented yet:** Alan integration; no multi-agent or autonomous LLM
+  extraction framework is present.
