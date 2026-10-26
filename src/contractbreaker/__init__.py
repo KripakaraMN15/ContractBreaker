@@ -24,6 +24,7 @@ from .hypothesis import (
     hypothesize_from_source,
     recommend_scenario,
 )
+from .retryable_error_verifier import verify_retryable_error_duplicate
 from .verifier import Report, Verdict, verify_duplicate_side_effects
 
 __all__ = [
@@ -54,5 +55,6 @@ __all__ = [
     "hypothesize_from_source",
     "recommend_scenario",
     "verify_duplicate_side_effects",
+    "verify_retryable_error_duplicate",
 ]
 

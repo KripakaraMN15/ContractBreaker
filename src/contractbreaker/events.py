@@ -22,6 +22,9 @@ class EventKind(str, Enum):
     RESPONSE_DROPPED = "response_dropped"
     RESPONSE_RETURNED = "response_returned"
     IDEMPOTENT_REPLAY = "idempotent_replay"
+    RETRY_POLICY_CONFIGURED = "retry_policy_configured"
+    RETRYABLE_ERROR_RETURNED = "retryable_error_returned"
+    RETRY_SCHEDULED = "retry_scheduled"
     SCENARIO_END = "scenario_end"
 
 
