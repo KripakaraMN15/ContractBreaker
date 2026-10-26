@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ContractBreaker — Reliability Investigations</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<a class="skip-link" href="#workspace">Skip to workspace</a>
+
+<header class="topbar">
+  <div class="topbar__brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path d="M12 2 4 6v6c0 5 3.4 8.6 8 10 4.6-1.4 8-5 8-10V6l-8-4Z" />
+      <path class="brand-mark__fault" d="M13.4 6.2 9.6 13h3.1l-2.1 5.4 4.4-7.1h-3.1l1.5-5.1Z" />
+    </svg>
+    <span class="topbar__name">ContractBreaker</span>
+    <span class="topbar__tag">reliability investigations</span>
+  </div>
+  <nav class="topbar__nav" aria-label="Primary">
+    <button type="button" class="navlink navlink--active" id="new-investigation">New investigation</button>
+    <span class="navlink navlink--disabled" title="History is not persisted in this build" aria-disabled="true">History</span>
+    <span class="navlink navlink--disabled" title="Settings are read from the environment" aria-disabled="true">Settings</span>
+  </nav>
+  <div class="topbar__meta">
+    <span class="chip chip--quiet" id="health-chip" title="Backend status">checking…</span>
+  </div>
+</header>
+
+<main id="workspace" class="workspace">
+  <section class="panel panel--request" aria-labelledby="request-heading">
+    <div class="panel__head">
+      <h2 class="panel__title" id="request-heading">Investigation request</h2>
+      <p class="panel__hint">Describe the failure you suspect. The workflow interprets the request, plans the test, and waits for your approval before running anything.</p>
+    </div>
+    <form class="form" id="request-form">
+      <div class="field field--grow">
+        <label class="field__label" for="request-input">Request</label>
+        <textarea class="input input--textarea" id="request-input" name="request" rows="3"
+          placeholder="e.g. duplicate charges after a lost response on the payment client"></textarea>
+        <p class="field__help" id="request-help">Leave empty when selecting a scenario and source explicitly.</p>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="source-select">Source file</label>
+        <select class="input" id="source-select" name="source">
+          <option value="">Select a Python file…</option>
+        </select>
+        <p class="field__help" id="source-help">Only files inside the allowed source root are listed.</p>
+      </div>
+
+      <div class="field">
+        <label class="field__label" for="scenario-select">Scenario</label>
+        <select class="input" id="scenario-select" name="scenario">
+          <option value="">Interpret from request</option>
+          <option value="lost-response">Lost response</option>
+          <option value="retryable-error">Retryable HTTP error</option>
+        </select>
+        <p class="field__help">Only these two scenarios are supported.</p>
+      </div>
+
+      <div class="field field--switch">
+        <label class="switch" for="llm-toggle">
+          <input type="checkbox" id="llm-toggle" name="llm_fallback" />
+          <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+          <span class="switch__label">
+            LLM fallback
+            <span class="switch__note" id="llm-note">Server-side only; may call the [OI] API.</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="field field--advanced">
+        <details>
+          <summary class="details__summary">Runtime constraints</summary>
+          <div class="advanced-grid">
+            <div class="field">
+              <label class="field__label" for="server-idempotency">Server idempotency</label>
+              <select class="input" id="server-idempotency">
+                <option value="">Auto (from client facts)</option>
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field__label" for="retry-statuses">Retryable statuses</label>
+              <input class="input" id="retry-statuses" placeholder="503" />
+              <p class="field__help">Comma separated. Retryable-error scenario only.</p>
+            </div>
+            <div class="field">
+              <label class="field__label" for="execution-timeout">Execution timeout (s)</label>
+              <input class="input" id="execution-timeout" type="number" min="1" max="300" placeholder="10" />
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <div class="form__actions">
+        <button type="submit" class="button button--primary" id="plan-button">
+          <svg viewBox="0 0 16 16" class="button__icon" aria-hidden="true"><path d="M2 8h12M9 3l5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          Plan investigation
+        </button>
+        <button type="button" class="button button--ghost" id="reset-button">Reset</button>
+        <span class="form__status" id="form-status" role="status" aria-live="polite"></span>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel panel--analysis" aria-labelledby="analysis-heading" id="analysis-panel" hidden>
+    <div class="panel__head">
+      <h2 class="panel__title" id="analysis-heading">Plan &amp; evidence</h2>
+      <p class="panel__hint" id="analysis-summary">Static analysis of the selected client. No code has been executed.</p>
+    </div>
+
+    <div class="readiness" id="readiness-banner" role="status" aria-live="polite">
+      <span class="readiness__icon" id="readiness-icon" aria-hidden="true"></span>
+      <div class="readiness__body">
+        <p class="readiness__title" id="readiness-title">Not planned yet</p>
+        <p class="readiness__detail" id="readiness-detail">Submit a plan to see extracted facts and blockers.</p>
+      </div>
+    </div>
+
+    <div class="cards" id="fact-cards"></div>
+
+    <div class="blockers" id="blockers-panel" hidden>
+      <h3 class="blockers__title">Blockers</h3>
+      <ul class="blockers__list" id="blockers-list"></ul>
+    </div>
+
+    <div class="provenance" id="provenance-panel" hidden>
+      <h3 class="provenance__title">Fact provenance</h3>
+      <table class="table table--compact">
+        <caption class="visually-hidden">Origin of each extracted fact</caption>
+        <thead><tr><th scope="col">Fact</th><th scope="col">Origin</th></tr></thead>
+        <tbody id="provenance-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel panel--approval" aria-labelledby="approval-heading" id="approval-panel" hidden>
+    <div class="panel__head">
+      <h2 class="panel__title" id="approval-heading">Approval</h2>
+      <p class="panel__hint">Execution runs the analyzed client in an isolated subprocess against a local test service. Review before approving.</p>
+    </div>
+    <dl class="summary" id="approval-summary"></dl>
+    <div class="approval__actions">
+      <button type="button" class="button button--danger" id="approve-button">
+        <svg viewBox="0 0 16 16" class="button__icon" aria-hidden="true"><path d="M3 8.5 6.2 11.5 13 4.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Approve and execute
+      </button>
+      <span class="form__status" id="approval-status" role="status" aria-live="polite"></span>
+    </div>
+  </section>
+
+  <section class="panel panel--results" aria-labelledby="results-heading" id="results-panel" hidden>
+    <div class="panel__head">
+      <h2 class="panel__title" id="results-heading">Runtime result</h2>
+      <p class="panel__hint">Observed by the ContractBreaker runtime. The causal verifier assigns the verdict.</p>
+    </div>
+
+    <div class="verdict" id="verdict-card" data-state="unknown">
+      <div class="verdict__head">
+        <span class="verdict__badge" id="verdict-badge">—</span>
+        <span class="verdict__effects" id="verdict-effects"></span>
+      </div>
+      <p class="verdict__reason" id="verdict-reason"></p>
+    </div>
+
+    <div class="trace" id="trace-panel">
+      <h3 class="trace__title">Causal trace <span class="trace__note" id="trace-note"></span></h3>
+      <ol class="timeline" id="timeline"></ol>
+    </div>
+
+    <div class="explanation">
+      <h3 class="explanation__title">Explanation</h3>
+      <pre class="explanation__body" id="explanation-body"></pre>
+    </div>
+
+    <div class="limitations" id="limitations-panel" hidden>
+      <h3 class="limitations__title">Limitations</h3>
+      <ul class="limitations__list" id="limitations-list"></ul>
+    </div>
+  </section>
+
+  <section class="panel panel--report" aria-labelledby="report-heading" id="report-panel" hidden>
+    <div class="panel__head panel__head--row">
+      <h2 class="panel__title" id="report-heading">Report</h2>
+      <div class="panel__actions">
+        <button type="button" class="button button--ghost button--small" id="export-button">Export JSON</button>
+        <button type="button" class="button button--ghost button--small" id="copy-button">Copy</button>
+      </div>
+    </div>
+    <details class="report-details" id="report-details">
+      <summary class="details__summary">Structured report</summary>
+      <pre class="report-json" id="report-json"></pre>
+    </details>
+  </section>
+</main>
+
+<footer class="footer">
+  <p>ContractBreaker runs the analyzed client in a subprocess with an in-process test service. This is deterministic test isolation, not a hardened security sandbox.</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
