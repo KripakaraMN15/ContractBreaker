@@ -67,6 +67,8 @@ def build_report(
     execution: ScenarioExecution | None,
     analysis_status: str,
     limitations: Iterable[str] = (),
+    llm_fallback: dict[str, Any] | None = None,
+    fact_provenance: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the stable JSON-native report dictionary."""
 
@@ -85,6 +87,23 @@ def build_report(
         "blockers": list(readiness.blockers),
         "unknowns": list(readiness.unknowns),
     }
+    hypothesis_dict["fact_provenance"] = (
+        dict(fact_provenance)
+        if fact_provenance is not None
+        else {
+            "method": "derived_from_extraction",
+            "endpoint": "derived_from_extraction",
+            "timeout": "derived_from_extraction",
+            "max_attempts": "derived_from_extraction",
+            "retry_count": "derived_from_extraction",
+            "retry_triggers": "derived_from_extraction",
+            "idempotency_key_present": "derived_from_extraction",
+            "idempotency_key_reused": "derived_from_extraction",
+        }
+    )
+    hypothesis_dict["llm_fallback"] = (
+        llm_fallback if llm_fallback is not None else _disabled_llm_fallback()
+    )
 
     if execution is None:
         reason = (
@@ -266,6 +285,57 @@ def render_text(report: dict[str, Any]) -> str:
         lines.append(f"  unknown: {unknown}")
     for warning in hypothesis.get("warnings", []):
         lines.append(f"  warning: {warning}")
+    llm = hypothesis.get("llm_fallback") or {}
+    lines.append(
+        f"  LLM fallback: {llm.get('outcome', 'disabled')}"
+        + (
+            f" (model={llm.get('model')}, api_called={llm.get('api_called')})"
+            if llm.get("enabled")
+            else ""
+        )
+    )
+    if llm.get("enabled"):
+        if llm.get("error"):
+            lines.append(f"    error: {llm['error']}")
+        lines.append(
+            "    unresolved="
+            f"{len(llm.get('unresolved_facts', []))}, "
+            f"proposed={len(llm.get('proposed_facts', []))}, "
+            f"accepted={len(llm.get('accepted_facts', []))}, "
+            f"rejected={len(llm.get('rejected_facts', []))}, "
+            f"conflicts={len(llm.get('conflicts', []))}"
+        )
+        if llm.get("runnability_before") is not None:
+            lines.append(
+                "    runnability: "
+                f"{llm.get('runnability_before')} -> "
+                f"{llm.get('runnability_after')}"
+            )
+        if llm.get("usage"):
+            lines.append(f"    usage: {llm['usage']}")
+        if llm.get("estimated_cost_usd") is not None:
+            lines.append(
+                f"    estimated_cost_usd: {llm['estimated_cost_usd']}"
+            )
+        for fact in llm.get("accepted_facts", []):
+            lines.append(
+                "    accepted: "
+                f"{fact.get('target_id')}.{fact.get('fact_type')}"
+                f"={fact.get('value')}"
+            )
+        for fact in llm.get("rejected_facts", []):
+            errors = "; ".join(fact.get("errors", []))
+            lines.append(
+                "    rejected: "
+                f"{fact.get('target_id')}.{fact.get('fact_type')}"
+                + (f" ({errors})" if errors else "")
+            )
+        for conflict in llm.get("conflicts", []):
+            lines.append(
+                "    conflict: "
+                f"{conflict.get('kind')} "
+                f"{conflict.get('target_id')}.{conflict.get('fact_type')}"
+            )
     lines.append("")
 
     configuration = report["scenario_configuration"]
@@ -362,6 +432,27 @@ def _fact(fact: dict[str, Any]) -> str:
     if reason:
         return f"{status} ({reason})"
     return str(status)
+
+
+def _disabled_llm_fallback() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "outcome": "disabled",
+        "model": None,
+        "api_called": False,
+        "error": None,
+        "unresolved_facts": [],
+        "proposed_facts": [],
+        "accepted_facts": [],
+        "rejected_facts": [],
+        "conflicts": [],
+        "usage": None,
+        "estimated_cost_usd": None,
+        "runnability_before": None,
+        "runnability_after": None,
+        "runnability_changed": None,
+        "limitations": [],
+    }
 
 
 def _event_dict(event: Event) -> dict[str, Any]:

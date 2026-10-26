@@ -3,11 +3,11 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 6A. The CLI executes the analyzed client for a narrow
-> supported contract and a separate benchmark command scores labeled
-> development and held-out datasets. Static extraction and hypotheses never
-> issue a verdict. Benchmark results are synthetic and do not establish general
-> production accuracy.
+> Status: milestone 6B. Deterministic extraction, runtime execution, and
+> benchmark scoring remain the baseline. An opt-in OpenAI fallback may propose
+> unresolved facts, but every accepted fact requires validated source evidence
+> and the existing runtime gates and verifier remain authoritative. Benchmark
+> results are synthetic and do not establish general production accuracy.
 
 ## The problem
 
@@ -20,26 +20,30 @@ tests can all pass while this happens.
 
 1. The CLI reads one supported Python client file and extracts retry, timeout,
    and idempotency facts.
-2. It builds a deterministic hypothesis and checks both scenario readiness and
-   the narrow executable-client contract.
-3. If runnable, a subprocess worker executes the analyzed module against an
+2. It builds a deterministic hypothesis. If `--llm-fallback` is enabled,
+   unresolved facts may be proposed by OpenAI, validated against exact source
+   evidence, and conservatively merged before the hypothesis is rebuilt.
+3. It checks both scenario readiness and the narrow executable-client contract.
+4. If runnable, a subprocess worker executes the analyzed module against an
    in-process Flask test service. All `requests` traffic is routed through the
    harness adapter, socket construction is blocked, and the parent enforces an
    execution timeout.
-4. The selected scenario simulates either a lost response after a server commit
+5. The selected scenario simulates either a lost response after a server commit
    or a configured retryable HTTP error after a commit.
-5. An append-only event log records requests, server receipt, commits, faults,
+6. An append-only event log records requests, server receipt, commits, faults,
    replays, and the terminal outcome with explicit attempt ids.
-6. The existing verifier checks the ordered causal chain and reconciles commits
+7. The existing verifier checks the ordered causal chain and reconciles commits
    with the observable side-effect ledger.
-7. `contractbreaker benchmark` runs labeled development and held-out datasets
+8. `contractbreaker benchmark` runs labeled development and held-out datasets
    through the same pipeline and scores extraction, runnability, and runtime
-   verification separately.
+   verification separately, optionally with LLM assistance.
 
-No external network or LLM calls are involved. Faults are deterministic. UUIDs
-identify operations and keys, but they do not affect the verdict logic. The
-bundled reference scenarios remain as programmatic verifier fixtures; the CLI
-does not silently substitute them for the analyzed source.
+Deterministic analysis makes no external network or LLM calls. The opt-in LLM
+fallback makes an OpenAI request only when explicitly enabled and unresolved
+facts exist. Faults are deterministic. UUIDs identify operations and keys, but
+they do not affect the verdict logic. The bundled reference scenarios remain as
+programmatic verifier fixtures; the CLI does not silently substitute them for
+the analyzed source.
 
 ## Strict verdict rules
 
@@ -85,6 +89,9 @@ contractbreaker analyze path/to/client.py --scenario auto --format json
 
 # Save the JSON report while keeping human-readable stdout.
 contractbreaker analyze path/to/client.py --scenario lost-response --output report.json
+
+# Opt in to the OpenAI extraction fallback for unresolved facts.
+contractbreaker analyze path/to/client.py --scenario lost-response --llm-fallback
 ```
 
 Options:
@@ -105,6 +112,8 @@ Options:
   explicitly.
 - `--execution-timeout SECONDS` limits isolated analyzed-client execution. The
   default is 10 seconds; a timeout produces a structured non-runnable report.
+- `--llm-fallback` opts in to the OpenAI fallback for unresolved extraction
+  facts. It may make a paid API request. See the LLM fallback section below.
 
 ### Exit codes
 
@@ -160,7 +169,7 @@ Reports use `schema_version = "1.0"` and contain:
 | `selected_scenario` | Scenario actually selected, or `null`. |
 | `source_file` | Analyzed file path. |
 | `extraction` | AST facts, locations, statuses, warnings; provenance `static_extraction`. |
-| `hypothesis` | Derived facts, unknowns, blockers, warnings, and scenario readiness; provenance `derived_from_extraction`. |
+| `hypothesis` | Derived facts, unknowns, blockers, warnings, scenario readiness, optional `fact_provenance`, and optional `llm_fallback` diagnostics; provenance `derived_from_extraction`. |
 | `scenario_configuration` | Effective settings, runner, execution state, and per-setting provenance. |
 | `execution` | Runtime event trace, attempt/operation/side-effect IDs, and observed count; provenance `runtime_observation`. |
 | `verdict`, `verdict_reason` | Final runtime verdict and evidence reason. |
@@ -168,9 +177,17 @@ Reports use `schema_version = "1.0"` and contain:
 | `limitations` | Scope and simulation caveats. |
 
 Provenance values distinguish static facts from other origins:
-`static_extraction`, `derived_from_extraction`, `cli`, `cli_default`,
-`scenario_default`, `runtime_observation`, `runtime_verifier`, and
-`not_executed`.
+`static_extraction`, `derived_from_extraction`, `llm_assisted`, `cli`,
+`cli_default`, `scenario_default`, `runtime_observation`,
+`runtime_verifier`, and `not_executed`.
+
+Milestone 6B keeps the top-level report keys and `schema_version` at `"1.0"`.
+It adds `hypothesis.fact_provenance` and `hypothesis.llm_fallback` as additive
+fields. `fact_provenance` is a per-fact map; `llm_fallback` records whether the
+fallback was enabled, its outcome, model/API-call state, unresolved and
+proposed facts, accepted/rejected facts, evidence errors, conflicts,
+runnability before/after, usage, and estimated cost. Consumers should tolerate
+additive fields within existing sections.
 
 An abridged confirmed report (the full event list is produced by the CLI):
 
@@ -365,6 +382,98 @@ is inside a method rather than at module level. The hypothesis reports those
 facts and refuses runtime execution until the source satisfies the executable
 client contract.
 
+## LLM extraction fallback (milestone 6B)
+
+The optional fallback helps interpret unresolved retry, timeout, and
+idempotency facts. It **proposes extraction facts only**:
+
+- It cannot issue `confirmed`, `not_reproduced`, or `inconclusive`.
+- It cannot remove deterministic warnings or widen the executable-client
+  contract.
+- It cannot make a hypothesis scenario-ready directly. The existing hypothesis
+  builder, runtime contract, scenario readiness checks, and causal verifier
+  remain the final gates.
+
+The fallback is disabled by default. Deterministic analysis never imports the
+OpenAI SDK and never makes an API request unless `--llm-fallback` is used.
+
+### Configuration
+
+Install the optional SDK extra:
+
+```bash
+python -m pip install -e ".[dev,llm]"
+```
+
+Set credentials and optional model configuration through the environment:
+
+```bash
+export OPENAI_API_KEY="..."
+export CONTRACTBREAKER_LLM_MODEL="gpt-4.1-mini"
+```
+
+Never put a real key in `.env.example` or a report. The API key is read only from
+`OPENAI_API_KEY`; it is never logged, printed, or serialized. `.env.example`
+contains placeholders only. ContractBreaker does not load `.env` automatically.
+
+The default model is `gpt-4.1-mini`. Requests use strict JSON Schema Structured
+Outputs, a 20-second timeout, and no automatic SDK retries. Missing credentials,
+missing SDK, auth errors, rate limits, timeouts, refusals, and malformed output
+produce a structured fallback outcome and preserve the deterministic analysis.
+
+### Merge policy
+
+1. Run the deterministic AST extractor.
+2. Identify unresolved facts (`unknown`, `ambiguous`, or `unsupported`).
+3. If fallback is enabled, send a bounded source excerpt and those unresolved
+   facts to OpenAI. Benchmark labels, expected verdicts, and scenario answers are
+   never included in the prompt.
+4. Validate each proposal's fact type, value, status, line range, and exact
+   source excerpt.
+5. Apply only `known` proposals for a deterministic `unknown` fact.
+6. Preserve all deterministic `known`/`absent` facts. Disagreement is recorded
+   as a conflict and rejected.
+7. Ambiguous/unsupported deterministic facts and unsupported runtime patterns
+   remain non-runnable. LLM proposals for them are advisory at most.
+8. Rebuild the client hypothesis and reapply the existing runtime contract,
+   readiness checks, and runtime verifier.
+
+Accepted facts receive per-fact provenance `llm_assisted`. The report includes
+`hypothesis.fact_provenance` and `hypothesis.llm_fallback` with the fallback
+outcome, model, whether the API was called, unresolved/proposed/accepted/
+rejected facts, evidence-validation errors, conflicts, runnability before/after,
+token usage, and estimated cost when configured.
+
+Cost is reported only when both `CONTRACTBREAKER_LLM_INPUT_USD_PER_1M` and
+`CONTRACTBREAKER_LLM_OUTPUT_USD_PER_1M` are set. Token usage is reported whenever
+the API supplies it. No pricing table is hardcoded.
+
+### Privacy and limits
+
+When `--llm-fallback` is enabled, a bounded source excerpt and unresolved-fact
+metadata are sent to the configured OpenAI model. The report includes the
+evidence excerpts needed to audit validation, but not the full source or API
+key. Do not enable the fallback for source code that must not leave your
+environment.
+
+The fallback does not support external wrapper implementations, imported
+libraries, dynamic values, or multi-file behavior. If evidence is insufficient,
+the correct outcome remains `unknown`, `ambiguous`, or `unsupported`.
+
+### Offline and live tests
+
+All ordinary tests use mocked SDK responses and require no credentials. The live
+smoke test is skipped unless all of these are true:
+
+```bash
+export CONTRACTBREAKER_LIVE_LLM=1
+export OPENAI_API_KEY="..."
+pytest tests/test_llm_live.py -q
+```
+
+This test makes a small paid API call and is intentionally not part of the
+default suite.
+
 ## Lost-response payment scenario
 
 `examples/payments` contains the reference payment fixtures:
@@ -416,6 +525,10 @@ receives an `idempotent_replay` and only one side effect exists, producing
 
 Requires Python 3.10+.
 
+Deterministic analysis needs only the base dependencies. For the optional LLM
+fallback, install the `llm` extra and set `OPENAI_API_KEY` and optionally
+`CONTRACTBREAKER_LLM_MODEL`; see `.env.example`.
+
 ### Windows PowerShell
 
 ```powershell
@@ -443,7 +556,8 @@ worker works outside the repository root.
 
 ## Tests
 
-The complete suite currently contains 106 tests.
+The complete suite currently collects 129 tests: 128 pass and the optional paid
+live OpenAI smoke test is skipped by default.
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
 
@@ -488,7 +602,7 @@ The complete suite currently contains 106 tests.
 - Retry decision without a retry request, incorrect ordering, mismatched
   attempt ids, and policy mismatch: `inconclusive`.
 
-`tests/test_cli.py` adds 20 CLI/report cases:
+`tests/test_cli.py` adds 21 CLI/report cases:
 
 - Buggy and protected clients for both runtime scenarios.
 - Automatic lost-response selection.
@@ -498,6 +612,8 @@ The complete suite currently contains 106 tests.
 - Missing files and output-write failures exit `4`.
 - JSON schema stability, JSON-native serialization, output-file writing, and
   invocation through `python -m contractbreaker` from outside the repository.
+- LLM fallback is opt-in, makes no API call when disabled, and flows validated
+  facts through to the runtime verdict.
 
 `tests/test_runtime_contract.py` adds 7 contract cases:
 
@@ -514,7 +630,7 @@ The complete suite currently contains 106 tests.
 - An incomplete runtime trace is inconclusive.
 - Execution timeout maps to a structured failure.
 
-`tests/test_benchmark.py` adds 8 benchmark cases:
+`tests/test_benchmark.py` adds 11 benchmark cases:
 
 - Known metric arithmetic and denominators.
 - Development/held-out CLI JSON, output files, and unsupported non-execution.
@@ -523,6 +639,24 @@ The complete suite currently contains 106 tests.
 - Missing/invalid datasets fail with exit `2`.
 - Missing `--dataset` is invalid CLI usage.
 - Dataset sources cannot escape their split directory.
+- LLM-assisted benchmark results are reported separately, with usage/cost and
+  fallback completion status.
+
+`tests/test_llm_fallback.py` adds 18 mocked fallback cases:
+
+- Valid evidence fills an unknown timeout and flows into runtime verification.
+- Missing, mismatched, and out-of-range evidence is rejected.
+- Hallucinated retry limits and deterministic-fact conflicts are rejected.
+- Disabled fallback makes zero API calls.
+- Missing credentials, timeouts, rate limits, refusals, malformed output, and
+  invalid top-level responses are handled without crashing deterministic analysis.
+- Ambiguous facts and unsupported runtime patterns remain non-runnable.
+- LLM-filled facts cannot force a `confirmed` verdict.
+- Model configuration and token-cost estimation.
+- Benchmark prompts contain no labels or expected verdicts.
+
+`tests/test_llm_live.py` is skipped unless `CONTRACTBREAKER_LIVE_LLM=1` and
+credentials are present.
 
 ## Benchmark (milestone 6A)
 
@@ -544,6 +678,10 @@ benchmark/
 
 Dataset name: `contractbreaker-synthetic`; dataset version: `1.0`.
 
+Benchmark reports keep `benchmark_schema_version` at `"1.0"`. Milestone 6B adds
+optional top-level `llm_assisted_splits` and `llm_fallback` sections plus
+`deterministic_all_matched`; these are additive fields.
+
 Each manifest case labels:
 
 - Inputs passed to the normal pipeline: scenario, server idempotency, retry
@@ -552,6 +690,9 @@ Each manifest case labels:
 - Expected warning codes.
 - Expected runnability, whether execution should occur, verdict, and
   side-effect count.
+- Optional `expected_llm` labels used only for the LLM-assisted scoring pass
+  when evidence can resolve a deterministic unknown (currently the unknown
+  timeout case). `expected_llm` is never included in the LLM prompt.
 
 Expected labels are **not** passed to `analyze`. The benchmark passes only the
 case inputs to the runtime pipeline, then scores the resulting report against
@@ -594,16 +735,26 @@ contractbreaker benchmark --dataset benchmark --format json
 # Write the JSON benchmark report to a file.
 contractbreaker benchmark --dataset benchmark --format json \
   --output benchmark-report.json
+
+# Also evaluate the LLM-assisted pass. This may make paid OpenAI calls.
+contractbreaker benchmark --dataset benchmark --llm-fallback --format json
 ```
 
 Benchmark exit codes:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | Every labeled case matched. |
+| `0` | Every requested pass matched. |
 | `1` | Completed with one or more mismatches. |
-| `2` | Dataset or execution could not be completed. |
+| `2` | Dataset, execution, or requested LLM pass could not be completed. |
 | `3` | Invalid CLI arguments. |
+
+When `--llm-fallback` is requested, the report includes both deterministic
+`splits` and `llm_assisted_splits`, plus an aggregate `llm_fallback` summary
+with API-call count, outcomes, token usage, estimated cost, accepted/rejected
+facts, conflicts, and invalid-evidence rejections. If the LLM pass is
+unavailable, the deterministic results are still reported, but the benchmark
+exits `2` because the requested comparison did not complete.
 
 ### Metric definitions
 
@@ -637,6 +788,13 @@ All rates include an explicit numerator and denominator in JSON.
 - **Case errors:** cases where the analysis raised and the benchmark recorded an
   error instead of omitting the case.
 
+LLM-assisted pass metrics use the same definitions, scoring against
+`expected_llm` when present and `expected` otherwise. Additional LLM summaries
+report API calls, fallback outcomes, accepted/rejected facts, evidence
+rejections, conflicts, token usage, and estimated cost. LLM cases with
+`unavailable` or `invalid_output` outcomes are marked incomplete and are not
+counted as successful LLM-assisted evaluation.
+
 ### Current synthetic results
 
 All 13 development and 10 held-out labeled cases matched their expected
@@ -650,6 +808,27 @@ labels.
 Held-out inconclusive cases: `held-lost-while-buggy`,
 `held-lost-retry-wrapper`, `held-retry-fresh-key`, `held-timeout-zero`,
 `held-unsupported-tenacity`, `held-parse-error`.
+
+An offline fake-provider LLM-assisted pass was also run through the same
+benchmark to validate the comparison path. The fake provider is **not a live
+model measurement**; it only proposes the locally evidenced timeout for
+`dev-unknown-timeout` and nothing else.
+
+| LLM-assisted pass (offline fake provider) | Cases | Status | Facts | Runnable/blocked | Incorrectly allowed | Detection | False positives | Side effects | Executed verdicts | Inconclusive |
+| --- | ---: | --- | --- | --- | ---: | --- | --- | --- | --- | ---: |
+| Development | 13 | 13/13 | 12/12 each | 8/5 | 0 | 3/3 | 0/4 | 8/8 | 8/8 | 6 |
+| Held-out | 10 | 10/10 | 9/9 each | 4/6 | 0 | 1/1 | 0/3 | 4/4 | 4/4 | 6 |
+
+The fake pass made 10 fake API calls, proposed one fact, accepted it, and
+recorded no conflicts or invalid-evidence rejections. Token usage was supplied
+by the fake provider; cost was `null` because no pricing rates were configured.
+The improvement from resolving `dev-unknown-timeout` is a demonstration of the
+measurement path, not a claim about model quality.
+
+No live OpenAI benchmark or smoke call was run for this report because the
+explicit `CONTRACTBREAKER_LIVE_LLM=1` opt-in was not set. The live smoke test is
+present but skipped by default. A live model result must be labeled separately
+from these offline/synthetic numbers.
 
 These numbers demonstrate the benchmark pipeline and the current narrow
 contract. They do not establish broad extraction accuracy, production safety,
@@ -709,10 +888,26 @@ or generalization beyond this synthetic dataset.
 - **Benchmark labels are scoring-only.** The benchmark passes only case inputs
   to the runtime pipeline; a dedicated test mislabels a case and confirms that
   the runtime verdict does not change.
+- **The LLM fallback is not a source of truth.** It only proposes facts. Every
+  accepted fact requires validated exact source evidence; conflicts, ambiguity,
+  unsupported facts, runtime-contract failures, and verifier outcomes remain
+  authoritative. LLM confidence is never used as evidence.
+- **LLM fallback sends source context to OpenAI.** When enabled, a bounded source
+  excerpt and unresolved-fact metadata leave the local environment. Reports
+  include evidence snippets needed for audit, but never API keys or the full
+  source. Do not enable fallback for code that must remain local.
+- **LLM cost depends on the account and model.** Token usage is reported when
+  available. Estimated cost is reported only if per-million input/output rates
+  are explicitly configured; no pricing table is assumed.
+- **No live model benchmark was run.** The documented LLM-assisted benchmark
+  numbers use a clearly labeled offline fake provider. The live smoke test is
+  skipped unless explicitly enabled with credentials. Offline fake results are
+  not evidence of OpenAI model accuracy or improvement.
 - **Reports are scenario evidence, not a security audit.** Unsupported patterns,
   unknown facts, and non-runnable hypotheses are reported as such and can never
   become `confirmed`.
 - **Not a safety proof.** A `not_reproduced` verdict says this deterministic
   scenario did not produce the duplicate; it does not prove the guard is
   correct for every payload, key scope, or deployment topology.
-- **Not implemented yet:** LLM fallback, dashboard, and Alan integration.
+- **Not implemented yet:** dashboard and Alan integration; no multi-agent or
+  autonomous LLM extraction framework is present.

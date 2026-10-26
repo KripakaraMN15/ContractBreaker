@@ -19,6 +19,8 @@ from .hypothesis import (
     HypothesisNotRunnable,
     hypothesize_from_extraction,
 )
+from .llm import LLMClient
+from .llm_fallback import LLMFallbackResult, run_llm_fallback
 from .report import ScenarioExecution, ScenarioReadiness, build_report
 from .retryable_error_verifier import verify_retryable_error_duplicate
 from .runtime import RuntimeExecutionError, run_analyzed_client
@@ -53,6 +55,8 @@ class AnalysisOptions:
     retry_statuses: tuple[int, ...] | None = None
     server_error_status: int | None = None
     execution_timeout: float | None = None
+    llm_fallback: bool = False
+    llm_client: LLMClient | None = None
 
 
 def analyze(options: AnalysisOptions) -> dict[str, Any]:
@@ -68,7 +72,15 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
         raise SourceReadError(f"source file could not be read: {path}") from exc
 
     extraction = extract_from_source(source, filename=str(path))
-    hypothesis = hypothesize_from_extraction(extraction)
+    hypothesis_before = hypothesize_from_extraction(extraction)
+    llm_result: LLMFallbackResult = run_llm_fallback(
+        source=source,
+        extraction=extraction,
+        hypothesis=hypothesis_before,
+        enabled=options.llm_fallback,
+        client=options.llm_client,
+    )
+    hypothesis = llm_result.hypothesis
     contract = check_runtime_contract(source, extraction)
     unsupported_extraction = extraction.status in _UNSUPPORTED_EXTRACTION
 
@@ -117,6 +129,33 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
         analysis_status = "not_runnable"
     else:
         analysis_status = "executed"
+
+    llm_diagnostics = llm_result.diagnostics
+    if options.llm_fallback:
+        before_readiness = (
+            None
+            if selected is None or unsupported_extraction
+            else _readiness_for_scenario(
+                selected, hypothesis_before, contract
+            )
+        )
+        before_runnable = bool(before_readiness and before_readiness.runnable)
+        after_runnable = bool(
+            selected is not None
+            and not unsupported_extraction
+            and readiness.runnable
+        )
+        llm_diagnostics["runnability_before"] = before_runnable
+        llm_diagnostics["runnability_after"] = after_runnable
+        llm_diagnostics["runnability_changed"] = (
+            before_runnable != after_runnable
+        )
+        if before_runnable != after_runnable:
+            llm_diagnostics["runnability_reason"] = (
+                "scenario readiness changed after validated LLM facts were merged"
+            )
+        else:
+            llm_diagnostics["runnability_reason"] = None
 
     execution: ScenarioExecution | None = None
     limitations: list[str] = []
@@ -190,6 +229,8 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
         execution=execution,
         analysis_status=analysis_status,
         limitations=limitations,
+        llm_fallback=llm_diagnostics,
+        fact_provenance=llm_result.fact_provenance,
     )
 
 
@@ -230,6 +271,18 @@ def _validate_options(options: AnalysisOptions) -> None:
         or options.execution_timeout <= 0
     ):
         raise AnalysisUsageError("--execution-timeout must be a positive number")
+
+
+def _readiness_for_scenario(
+    scenario: str,
+    hypothesis: ClientHypothesis,
+    contract: RuntimeContract,
+) -> ScenarioReadiness:
+    if scenario == "lost-response":
+        return _merge_contract(_lost_response_readiness(hypothesis), contract)
+    if scenario == "retryable-error":
+        return _merge_contract(_retryable_error_readiness(hypothesis), contract)
+    raise AnalysisUsageError("no scenario readiness is available")
 
 
 def _select_scenario(

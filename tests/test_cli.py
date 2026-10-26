@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from contractbreaker.cli import main
+from contractbreaker.llm import LLMResponse, LLMUsage
 from contractbreaker.report import (
     EXIT_CONFIRMED,
     EXIT_INCONCLUSIVE,
@@ -100,6 +101,57 @@ def send(use_key, key):
         except requests.exceptions.Timeout:
             continue
 """
+
+UNKNOWN_TIMEOUT_SOURCE = """import requests
+
+configured_timeout = 5
+for attempt in range(2):
+    try:
+        requests.post(
+            "http://service.test/payments",
+            json={"amount_cents": 1999},
+            timeout=configured_timeout,
+        )
+    except requests.exceptions.Timeout:
+        continue
+"""
+
+
+class FakeLLMClient:
+    model = "offline-fake-model"
+
+    def __init__(self):
+        self.requests = []
+
+    def extract(self, request):
+        self.requests.append(request)
+        proposals = []
+        for line in request.excerpt.splitlines():
+            if "configured_timeout = 5" in line:
+                line_number = int(line.split(":", 1)[0].strip())
+                proposals.append(
+                    {
+                        "target_id": "call:0",
+                        "fact_type": "timeout",
+                        "value": 5,
+                        "status": "known",
+                        "evidence": [
+                            {
+                                "start_line": line_number,
+                                "end_line": line_number,
+                                "excerpt": "configured_timeout = 5",
+                            }
+                        ],
+                        "reason": "literal timeout assignment",
+                        "limitations": [],
+                    }
+                )
+                break
+        return LLMResponse(
+            proposals=tuple(proposals),
+            model=self.model,
+            usage=LLMUsage(100, 20, 120),
+        )
 
 
 def write_source(tmp_path: Path, name: str, source: str) -> Path:
@@ -559,6 +611,56 @@ def test_output_write_failure_exits_four(tmp_path, capsys) -> None:
 
     assert code == EXIT_UNSUPPORTED_INPUT
     assert "could not write report" in captured.err
+
+
+def test_cli_llm_fallback_is_opt_in(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    source = write_source(tmp_path, "unknown_timeout.py", UNKNOWN_TIMEOUT_SOURCE)
+
+    def forbidden_factory(**kwargs):
+        raise AssertionError("LLM factory must not be called when fallback is disabled")
+
+    monkeypatch.setattr(
+        "contractbreaker.llm_fallback.create_default_llm_client",
+        forbidden_factory,
+    )
+    code, out, _ = run_cli(
+        ["analyze", str(source), "--scenario", "lost-response", "--format", "json"],
+        capsys,
+    )
+    disabled = parse_json_output(out)
+    assert code == EXIT_INCONCLUSIVE
+    assert disabled["hypothesis"]["llm_fallback"]["enabled"] is False
+    assert disabled["hypothesis"]["timeout"]["status"] == "unknown"
+
+    fake = FakeLLMClient()
+    monkeypatch.setattr(
+        "contractbreaker.llm_fallback.create_default_llm_client",
+        lambda **kwargs: fake,
+    )
+    code, out, _ = run_cli(
+        [
+            "analyze",
+            str(source),
+            "--scenario",
+            "lost-response",
+            "--llm-fallback",
+            "--format",
+            "json",
+        ],
+        capsys,
+    )
+    enabled = parse_json_output(out)
+    assert code == EXIT_CONFIRMED
+    assert len(fake.requests) == 1
+    llm = enabled["hypothesis"]["llm_fallback"]
+    assert llm["enabled"] is True
+    assert llm["outcome"] == "success"
+    assert llm["accepted_facts"][0]["fact_type"] == "timeout"
+    assert enabled["hypothesis"]["timeout"]["value"] == 5
+    assert enabled["hypothesis"]["fact_provenance"]["timeout"] == "llm_assisted"
+    assert enabled["verdict"] == "confirmed"
 
 
 def test_module_entrypoint_works_outside_repo(tmp_path) -> None:

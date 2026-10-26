@@ -18,6 +18,11 @@ from contractbreaker.benchmark import (
     run_benchmark,
 )
 from contractbreaker.cli import main
+from contractbreaker.llm import (
+    LLMResponse,
+    LLMUnavailable,
+    LLMUsage,
+)
 
 BUGGY_SOURCE = """import requests
 
@@ -34,6 +39,20 @@ for attempt in range(2):
 
 UNSUPPORTED_SOURCE = """import httpx
 httpx.post("http://service.test/payments", timeout=1)
+"""
+
+UNKNOWN_TIMEOUT_SOURCE = """import requests
+
+configured_timeout = 5
+for attempt in range(2):
+    try:
+        requests.post(
+            "http://service.test/payments",
+            json={"amount_cents": 1999},
+            timeout=configured_timeout,
+        )
+    except requests.exceptions.Timeout:
+        continue
 """
 
 
@@ -86,11 +105,13 @@ def write_case(
     source: str,
     scenario: str,
     expected: dict,
+    *,
+    expected_llm: dict | None = None,
 ) -> dict:
     split_dir = root / split
     split_dir.mkdir(parents=True, exist_ok=True)
     (split_dir / source_name).write_text(source, encoding="utf-8")
-    return {
+    case = {
         "id": case_id,
         "source": source_name,
         "scenario": scenario,
@@ -98,6 +119,9 @@ def write_case(
         "expected": expected,
         "notes": "test case",
     }
+    if expected_llm is not None:
+        case["expected_llm"] = expected_llm
+    return case
 
 
 def write_dataset(
@@ -456,6 +480,212 @@ def test_benchmark_records_case_errors(tmp_path) -> None:
     assert case["matched"] is False
     assert report["splits"]["development"]["metrics"]["runtime"]["case_errors"] == 1
     assert benchmark_exit_code(report) == EXIT_BENCHMARK_MISMATCH
+
+
+def unknown_timeout_expected(*, resolved: bool) -> dict:
+    return {
+        "extraction_status": "supported" if resolved else "partial",
+        "facts": {
+            "method": fact("known", "POST"),
+            "endpoint": fact("known", "http://service.test/payments"),
+            "timeout": fact("known", 5) if resolved else fact("unknown"),
+            "retry_count": fact("known", 1),
+            "retry_triggers": fact(
+                "known", ["requests.exceptions.Timeout"]
+            ),
+            "idempotency_key_present": fact("absent"),
+            "idempotency_key_reused": fact("absent"),
+        },
+        "warning_codes": [],
+        "runnable": resolved,
+        "execution_expected": resolved,
+        "verdict": "confirmed" if resolved else "inconclusive",
+        "side_effects": 2 if resolved else None,
+    }
+
+
+class FakeLLMClient:
+    model = "offline-fake-model"
+
+    def __init__(self, *, unavailable: bool = False):
+        self.unavailable = unavailable
+        self.requests = []
+
+    def extract(self, request):
+        self.requests.append(request)
+        if self.unavailable:
+            raise LLMUnavailable("unavailable", "offline fake unavailable")
+        proposals = []
+        for line in request.excerpt.splitlines():
+            if "configured_timeout = 5" in line:
+                line_number = int(line.split(":", 1)[0].strip())
+                proposals.append(
+                    {
+                        "target_id": "call:0",
+                        "fact_type": "timeout",
+                        "value": 5,
+                        "status": "known",
+                        "evidence": [
+                            {
+                                "start_line": line_number,
+                                "end_line": line_number,
+                                "excerpt": "configured_timeout = 5",
+                            }
+                        ],
+                        "reason": "literal timeout assignment",
+                        "limitations": [],
+                    }
+                )
+                break
+        return LLMResponse(
+            proposals=tuple(proposals),
+            model=self.model,
+            usage=LLMUsage(100, 20, 120),
+        )
+
+
+def test_llm_assisted_benchmark_is_reported_separately(tmp_path) -> None:
+    development = write_case(
+        tmp_path,
+        "development",
+        "dev-unknown-timeout",
+        "unknown_timeout.py",
+        UNKNOWN_TIMEOUT_SOURCE,
+        "lost-response",
+        unknown_timeout_expected(resolved=False),
+        expected_llm=unknown_timeout_expected(resolved=True),
+    )
+    held = write_case(
+        tmp_path,
+        "held_out",
+        "held-unsupported",
+        "unsupported.py",
+        UNSUPPORTED_SOURCE,
+        "lost-response",
+        unsupported_expected(),
+    )
+    write_dataset(tmp_path, [development], [held])
+    fake = FakeLLMClient()
+
+    report = run_benchmark(
+        tmp_path, llm_fallback=True, llm_client=fake
+    )
+
+    assert report["deterministic_all_matched"] is True
+    assert report["all_matched"] is True
+    deterministic_case = report["splits"]["development"]["cases"][0]
+    llm_case = report["llm_assisted_splits"]["development"]["cases"][0]
+    assert deterministic_case["expected_source"] == "expected"
+    assert llm_case["expected_source"] == "expected_llm"
+    assert deterministic_case["actual"]["verdict"] == "inconclusive"
+    assert llm_case["actual"]["verdict"] == "confirmed"
+    assert llm_case["actual"]["facts"]["timeout"] == {
+        "status": "known",
+        "value": 5,
+    }
+    assert llm_case["actual"]["fact_provenance"]["timeout"] == "llm_assisted"
+    summary = report["llm_fallback"]
+    assert summary["status"] == "completed"
+    assert summary["api_calls"] == 1
+    assert summary["accepted_facts"] == 1
+    assert summary["usage"] == {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 120,
+    }
+    assert benchmark_exit_code(report) == EXIT_BENCHMARK_OK
+
+    request_payload = json.dumps(
+        {
+            "filename": fake.requests[0].filename,
+            "excerpt": fake.requests[0].excerpt,
+            "unresolved": fake.requests[0].unresolved,
+        },
+        sort_keys=True,
+    )
+    for leaked in ("confirmed", "inconclusive", "expected_llm", "benchmark"):
+        assert leaked not in request_payload
+
+
+def test_benchmark_cli_llm_fallback_with_fake_factory(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    development = write_case(
+        tmp_path,
+        "development",
+        "dev-unknown-timeout",
+        "unknown_timeout.py",
+        UNKNOWN_TIMEOUT_SOURCE,
+        "lost-response",
+        unknown_timeout_expected(resolved=False),
+        expected_llm=unknown_timeout_expected(resolved=True),
+    )
+    held = write_case(
+        tmp_path,
+        "held_out",
+        "held-unsupported",
+        "unsupported.py",
+        UNSUPPORTED_SOURCE,
+        "lost-response",
+        unsupported_expected(),
+    )
+    write_dataset(tmp_path, [development], [held])
+    fake = FakeLLMClient()
+    monkeypatch.setattr(
+        "contractbreaker.llm_fallback.create_default_llm_client",
+        lambda **kwargs: fake,
+    )
+
+    code = main(
+        [
+            "benchmark",
+            "--dataset",
+            str(tmp_path),
+            "--llm-fallback",
+            "--format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+
+    assert code == EXIT_BENCHMARK_OK
+    assert report["llm_fallback"]["status"] == "completed"
+    assert report["llm_assisted_splits"]["development"]["cases"][0]["actual"][
+        "verdict"
+    ] == "confirmed"
+
+
+def test_llm_benchmark_unavailable_exits_error(tmp_path) -> None:
+    development = write_case(
+        tmp_path,
+        "development",
+        "dev-unknown-timeout",
+        "unknown_timeout.py",
+        UNKNOWN_TIMEOUT_SOURCE,
+        "lost-response",
+        unknown_timeout_expected(resolved=False),
+        expected_llm=unknown_timeout_expected(resolved=True),
+    )
+    held = write_case(
+        tmp_path,
+        "held_out",
+        "held-unsupported",
+        "unsupported.py",
+        UNSUPPORTED_SOURCE,
+        "lost-response",
+        unsupported_expected(),
+    )
+    write_dataset(tmp_path, [development], [held])
+
+    report = run_benchmark(
+        tmp_path,
+        llm_fallback=True,
+        llm_client=FakeLLMClient(unavailable=True),
+    )
+
+    assert report["llm_fallback"]["status"] == "unavailable"
+    assert benchmark_exit_code(report) == EXIT_BENCHMARK_ERROR
 
 
 def test_dataset_loader_rejects_source_outside_split(tmp_path) -> None:

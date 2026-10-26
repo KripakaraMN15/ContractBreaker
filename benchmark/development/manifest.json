@@ -208,7 +208,24 @@
         "verdict": "inconclusive",
         "side_effects": null
       },
-      "notes": "Development pattern: timeout supplied through an identifier."
+      "expected_llm": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Development pattern: timeout supplied through an identifier; expected_llm reflects explicit local assignment evidence."
     },
     {
       "id": "dev-fresh-key",

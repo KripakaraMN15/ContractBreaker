@@ -155,6 +155,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     analyze_parser.add_argument(
+        "--llm-fallback",
+        action="store_true",
+        help=(
+            "opt in to OpenAI extraction fallback for unresolved facts; "
+            "requires OPENAI_API_KEY and the contractbreaker[llm] extra"
+        ),
+    )
+    analyze_parser.add_argument(
         "--execution-timeout",
         type=float,
         default=None,
@@ -188,6 +196,14 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("text", "json"),
         default="text",
         help="stdout format (default: text)",
+    )
+    benchmark_parser.add_argument(
+        "--llm-fallback",
+        action="store_true",
+        help=(
+            "also evaluate the LLM-assisted extraction path; requires "
+            "OPENAI_API_KEY and the contractbreaker[llm] extra"
+        ),
     )
     benchmark_parser.add_argument(
         "--output",
@@ -228,6 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 server_error_status=args.server_error_status,
                 execution_timeout=args.execution_timeout,
+                llm_fallback=args.llm_fallback,
             )
         )
     except SourceReadError as exc:
@@ -257,7 +274,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 def _run_benchmark_command(args: argparse.Namespace) -> int:
     try:
-        report = run_benchmark(args.dataset)
+        report = run_benchmark(
+            args.dataset, llm_fallback=args.llm_fallback
+        )
     except BenchmarkDatasetError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_BENCHMARK_ERROR
