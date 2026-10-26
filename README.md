@@ -3,9 +3,10 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 2.1. The build verifies one response-loss scenario, extracts
-> narrow client retry/timeout facts, and derives deterministic hypotheses that
-> can be mapped onto the reference scenario. Static extraction never issues a
+> Status: milestone 3. The build verifies two distinct failure scenarios:
+> lost response after commit, and commit followed by a retryable HTTP error.
+> It also extracts narrow client retry/timeout facts and derives deterministic
+> hypotheses for the lost-response scenario. Static extraction never issues a
 > verdict.
 
 ## The problem
@@ -156,7 +157,7 @@ session is now recognized, but its f-string endpoint, `self._timeout`, and
 therefore reports the call but refuses to run until those facts are made
 statically explicit.
 
-## Reference payment scenario
+## Lost-response payment scenario
 
 `examples/payments` contains a small payment client and Flask service:
 
@@ -166,6 +167,33 @@ statically explicit.
   committed payment to a ledger.
 - `examples/payments/scenario.py` wires both sides to the fault adapter and
   returns a verifier `Report`.
+
+## Retryable-error scenario
+
+This is a separate scenario from the lost-response case. The server commits the
+side effect first and then returns an HTTP error such as `503`. A client retries
+only because an explicit `RetryPolicy` includes that status.
+
+`examples/payments/retryable_error_scenario.py` runs the scenario and returns a
+verifier `Report`. The trace contains:
+
+- `retry_policy_configured` with the exact retryable status set and retry budget.
+- `request_sent` and `request_received` per attempt.
+- `side_effect_committed` with a unique side-effect id.
+- `retryable_error_returned` tied to the attempt that received the error.
+- `retry_scheduled` tied to the same attempt and recording the status that
+  triggered the retry.
+- A retry request with a new attempt id and the same operation id.
+
+The verifier confirms a duplicate only when the first commit precedes the
+retryable error, the retry decision follows that error and matches the configured
+policy, the retry request follows the decision, and the retry commits a second
+unique side effect. A retry request without a recorded policy decision is
+`inconclusive`; a 5xx status is never assumed to be retried.
+
+The fixed variant enables server idempotency and sends a stable key. The retry
+receives an `idempotent_replay` and only one side effect exists, producing
+`not_reproduced`.
 
 ## Setup
 
@@ -228,6 +256,16 @@ The test suite is deterministic and does not require network access.
 - Unsupported extraction blocks scenario construction.
 - Per-attempt idempotency key is not mapped onto the stable-key scenario.
 
+`tests/test_retryable_error_scenario.py` adds 12 cases:
+
+- Buggy retryable error: `confirmed`, two side effects.
+- Fixed idempotency variant: `not_reproduced`, one side effect.
+- Empty policy, status outside the policy, and zero retry budget: no retry.
+- Missing retryable-error event, missing policy event, and retry without a
+  recorded policy decision: `inconclusive`.
+- Retry decision without a retry request, incorrect ordering, mismatched
+  attempt ids, and policy mismatch: `inconclusive`.
+
 ## Known limitations
 
 - **Simulated failures only.** The adapter routes `requests` calls into a Flask
@@ -235,8 +273,8 @@ The test suite is deterministic and does not require network access.
   does not inject real network-level failures, packet loss, or a real dropped
   HTTP response. The boundary being modeled is "server committed, client saw a
   timeout", not an actual socket-level fault.
-- **Single runtime scenario.** Only the duplicate-side-effect retry conflict is
-  covered by the causal verifier.
+- **Two runtime scenarios only.** Lost-response and commit-then-retryable-error
+  are covered. No other failure modes or retry backoff schedules are modeled.
 - **Narrow AST support.** The extractor handles only explicit requests patterns
   listed above. It does not perform data-flow analysis, trace wrappers across
   files, evaluate arbitrary expressions, follow decorators, or understand
@@ -252,9 +290,12 @@ The test suite is deterministic and does not require network access.
   ambiguous, so the hypothesis correctly refuses to configure a scenario.
 - **Hypothesis scope.** A runnable hypothesis requires exactly one recognized
   call, a literal positive timeout, a known retry count, an identified
-  timeout/connection trigger, and a stable or absent idempotency key.
+  timeout/connection trigger, and a stable or absent idempotency key. Hypothesis
+  mapping currently targets the lost-response scenario.
+- **Retryable-error scenario is configured explicitly.** It is not derived from
+  static extraction. Its verdict depends on the exact configured status set and
+  retry budget; another client or policy must be modeled separately.
 - **Not a safety proof.** A `not_reproduced` verdict says this deterministic
   scenario did not produce the duplicate; it does not prove the guard is
   correct for every payload, key scope, or deployment topology.
-- **Not implemented yet:** LLM fallback, the second scenario, dashboard, and
-  Alan integration.
+- **Not implemented yet:** LLM fallback, dashboard, and Alan integration.
