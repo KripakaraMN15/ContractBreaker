@@ -88,6 +88,56 @@ http.request("PATCH", "https://api.test/items/1", timeout=1)
     assert call.endpoint.value == "https://api.test/items/1"
 
 
+def test_supported_injected_annotated_session_method() -> None:
+    result = extract(
+        """import requests
+class Client:
+    def __init__(self, session: requests.Session):
+        self._session = session
+    def send(self):
+        self._session.post("https://api.test/payments", timeout=1)
+"""
+    )
+
+    assert result.status is ExtractionStatus.SUPPORTED
+    assert len(result.calls) == 1
+    assert result.calls[0].method.value == "POST"
+    assert result.calls[0].endpoint.value == "https://api.test/payments"
+
+
+def test_unannotated_injected_session_stays_unsupported() -> None:
+    result = extract(
+        """import requests
+class Client:
+    def __init__(self, session):
+        self._session = session
+    def send(self):
+        self._session.post("https://api.test/payments", timeout=1)
+"""
+    )
+
+    assert result.status is ExtractionStatus.UNSUPPORTED
+    assert result.calls == ()
+    assert "unsupported.http_call" in {warning.code for warning in result.warnings}
+
+
+def test_conditional_idempotency_key_is_ambiguous() -> None:
+    result = extract(
+        """import requests
+def send(use_key, key):
+    headers = {}
+    if use_key:
+        headers["Idempotency-Key"] = key
+    return requests.post(
+        "https://api.test/payments", headers=headers, timeout=1
+    )
+"""
+    )
+
+    assert result.status is ExtractionStatus.PARTIAL
+    assert result.calls[0].idempotency_key.status is FactStatus.AMBIGUOUS
+
+
 def test_supported_tracked_session_method() -> None:
     result = extract(
         """import requests
