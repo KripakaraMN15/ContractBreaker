@@ -13,7 +13,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .ast_extractor import extract_from_source
-from .extraction import ExtractionStatus, FactStatus
+from .extraction import ExtractionResult, ExtractionStatus, FactStatus
 from .hypothesis import (
     ClientHypothesis,
     HypothesisNotRunnable,
@@ -59,8 +59,55 @@ class AnalysisOptions:
     llm_client: LLMClient | None = None
 
 
-def analyze(options: AnalysisOptions) -> dict[str, Any]:
-    """Extract, configure, execute the analyzed client, and verify its trace."""
+@dataclass(frozen=True)
+class AnalysisSettings:
+    """Runtime settings resolved from CLI input and scenario defaults."""
+
+    retry_statuses: tuple[int, ...] | None
+    retry_provenance: str | None
+    server_error_status: int | None
+    server_error_provenance: str | None
+    execution_timeout: float
+    execution_timeout_provenance: str
+
+
+@dataclass(frozen=True)
+class PreparedAnalysis:
+    """Everything known before any runtime execution.
+
+    Preparing is read-only: it extracts facts, applies the optional LLM
+    fallback, and resolves readiness, but never runs the analyzed client.
+    """
+
+    options: AnalysisOptions
+    path: Path
+    extraction: ExtractionResult
+    hypothesis_before: ClientHypothesis
+    hypothesis: ClientHypothesis
+    llm_result: LLMFallbackResult
+    llm_diagnostics: dict[str, Any]
+    contract: RuntimeContract
+    selected: str | None
+    readiness: ScenarioReadiness
+    ready: bool
+    pre_status: str
+    unsupported_extraction: bool
+    settings: AnalysisSettings
+    limitations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExecutionOutcome:
+    """A runtime attempt plus the report status it produced."""
+
+    execution: ScenarioExecution | None
+    readiness: ScenarioReadiness
+    analysis_status: str
+    limitations: tuple[str, ...]
+
+
+def prepare_analysis(options: AnalysisOptions) -> PreparedAnalysis:
+    """Run extraction, fallback, readiness, and contract checks only."""
 
     _validate_options(options)
     path = Path(options.source)
@@ -83,7 +130,203 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
     hypothesis = llm_result.hypothesis
     contract = check_runtime_contract(source, extraction)
     unsupported_extraction = extraction.status in _UNSUPPORTED_EXTRACTION
+    settings = _resolve_settings(options)
 
+    selected, readiness = _select_scenario(
+        options, hypothesis, unsupported_extraction, contract
+    )
+    if unsupported_extraction:
+        readiness = ScenarioReadiness(
+            selected,
+            False,
+            _dedupe(
+                (
+                    f"extraction status is {extraction.status.value}",
+                    *readiness.blockers,
+                )
+            ),
+            readiness.unknowns,
+        )
+        pre_status = "unsupported_input"
+    elif not readiness.runnable:
+        pre_status = "not_runnable"
+    else:
+        pre_status = "executed"
+
+    llm_diagnostics = llm_result.diagnostics
+    if options.llm_fallback:
+        before_readiness = (
+            None
+            if selected is None or unsupported_extraction
+            else _readiness_for_scenario(selected, hypothesis_before, contract)
+        )
+        before_runnable = bool(before_readiness and before_readiness.runnable)
+        after_runnable = bool(
+            selected is not None
+            and not unsupported_extraction
+            and readiness.runnable
+        )
+        llm_diagnostics["runnability_before"] = before_runnable
+        llm_diagnostics["runnability_after"] = after_runnable
+        llm_diagnostics["runnability_changed"] = (
+            before_runnable != after_runnable
+        )
+        if before_runnable != after_runnable:
+            llm_diagnostics["runnability_reason"] = (
+                "scenario readiness changed after validated LLM facts were merged"
+            )
+        else:
+            llm_diagnostics["runnability_reason"] = None
+
+    limitations: list[str] = []
+    if pre_status == "unsupported_input":
+        limitations.append(
+            "No runtime scenario was executed because the source is "
+            "unsupported or has no recognized requests call."
+        )
+    elif pre_status == "not_runnable":
+        limitations.extend(
+            (
+                (
+                    "No runtime scenario was executed because required facts or "
+                    "the runtime execution contract were unresolved."
+                ),
+                (
+                    "The analyzed source was not substituted with the bundled "
+                    "reference client."
+                ),
+            )
+        )
+        if options.scenario == "auto":
+            limitations.append(
+                "Automatic selection currently supports only a runnable "
+                "lost-response hypothesis; specify a scenario explicitly."
+            )
+
+    return PreparedAnalysis(
+        options=options,
+        path=path,
+        extraction=extraction,
+        hypothesis_before=hypothesis_before,
+        hypothesis=hypothesis,
+        llm_result=llm_result,
+        llm_diagnostics=llm_diagnostics,
+        contract=contract,
+        selected=selected,
+        readiness=readiness,
+        ready=pre_status == "executed",
+        pre_status=pre_status,
+        unsupported_extraction=unsupported_extraction,
+        settings=settings,
+        limitations=tuple(limitations),
+    )
+
+
+def execute_prepared(prepared: PreparedAnalysis) -> ExecutionOutcome:
+    """Execute a prepared scenario only when readiness checks passed."""
+
+    if not prepared.ready:
+        return ExecutionOutcome(
+            execution=None,
+            readiness=prepared.readiness,
+            analysis_status=prepared.pre_status,
+            limitations=prepared.limitations,
+        )
+
+    options = prepared.options
+    settings = prepared.settings
+    readiness = prepared.readiness
+    execution: ScenarioExecution | None = None
+    analysis_status = "executed"
+    limitations: list[str] = []
+
+    try:
+        if prepared.selected == "lost-response":
+            execution, execution_limits = _execute_lost_response(
+                prepared.hypothesis,
+                options,
+                prepared.path,
+                settings.execution_timeout,
+                settings.execution_timeout_provenance,
+            )
+        elif prepared.selected == "retryable-error":
+            assert settings.retry_statuses is not None
+            assert settings.retry_provenance is not None
+            assert settings.server_error_status is not None
+            assert settings.server_error_provenance is not None
+            execution, execution_limits = _execute_retryable_error(
+                prepared.hypothesis,
+                options,
+                prepared.path,
+                settings.retry_statuses,
+                settings.retry_provenance,
+                settings.server_error_status,
+                settings.server_error_provenance,
+                settings.execution_timeout,
+                settings.execution_timeout_provenance,
+            )
+        else:
+            raise AnalysisUsageError("no runnable scenario was selected")
+        limitations.extend(execution_limits)
+    except RuntimeExecutionError as exc:
+        failure = f"runtime execution failed: {exc}"
+        readiness = ScenarioReadiness(
+            prepared.selected,
+            False,
+            _dedupe((failure, *readiness.blockers)),
+            prepared.hypothesis.unknowns,
+        )
+        analysis_status = "not_runnable"
+        execution = None
+        limitations.append(failure)
+
+    if analysis_status == "not_runnable" and not execution:
+        limitations.extend(
+            (
+                (
+                    "No runtime scenario was executed because required facts or "
+                    "the runtime execution contract were unresolved."
+                ),
+                (
+                    "The analyzed source was not substituted with the bundled "
+                    "reference client."
+                ),
+            )
+        )
+        if prepared.options.scenario == "auto":
+            limitations.append(
+                "Automatic selection currently supports only a runnable "
+                "lost-response hypothesis; specify a scenario explicitly."
+            )
+
+    return ExecutionOutcome(
+        execution=execution,
+        readiness=readiness,
+        analysis_status=analysis_status,
+        limitations=tuple(limitations),
+    )
+
+
+def analyze(options: AnalysisOptions) -> dict[str, Any]:
+    """Extract, prepare, execute when runnable, and build the report."""
+
+    prepared = prepare_analysis(options)
+    outcome = execute_prepared(prepared)
+    return build_report(
+        source_file=str(prepared.path),
+        requested_scenario=options.scenario,
+        extraction=prepared.extraction,
+        hypothesis=prepared.hypothesis,
+        readiness=outcome.readiness,
+        execution=outcome.execution,
+        analysis_status=outcome.analysis_status,
+        limitations=outcome.limitations,
+        llm_fallback=prepared.llm_diagnostics,
+        fact_provenance=prepared.llm_result.fact_provenance,
+    )
+
+
+def _resolve_settings(options: AnalysisOptions) -> AnalysisSettings:
     retry_statuses: tuple[int, ...] | None = None
     retry_provenance: str | None = None
     server_error_status: int | None = None
@@ -109,128 +352,13 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
         execution_timeout = float(options.execution_timeout)
         execution_timeout_provenance = "cli"
 
-    selected, readiness = _select_scenario(
-        options, hypothesis, unsupported_extraction, contract
-    )
-    if unsupported_extraction:
-        readiness = ScenarioReadiness(
-            selected,
-            False,
-            _dedupe(
-                (
-                    f"extraction status is {extraction.status.value}",
-                    *readiness.blockers,
-                )
-            ),
-            readiness.unknowns,
-        )
-        analysis_status = "unsupported_input"
-    elif not readiness.runnable:
-        analysis_status = "not_runnable"
-    else:
-        analysis_status = "executed"
-
-    llm_diagnostics = llm_result.diagnostics
-    if options.llm_fallback:
-        before_readiness = (
-            None
-            if selected is None or unsupported_extraction
-            else _readiness_for_scenario(
-                selected, hypothesis_before, contract
-            )
-        )
-        before_runnable = bool(before_readiness and before_readiness.runnable)
-        after_runnable = bool(
-            selected is not None
-            and not unsupported_extraction
-            and readiness.runnable
-        )
-        llm_diagnostics["runnability_before"] = before_runnable
-        llm_diagnostics["runnability_after"] = after_runnable
-        llm_diagnostics["runnability_changed"] = (
-            before_runnable != after_runnable
-        )
-        if before_runnable != after_runnable:
-            llm_diagnostics["runnability_reason"] = (
-                "scenario readiness changed after validated LLM facts were merged"
-            )
-        else:
-            llm_diagnostics["runnability_reason"] = None
-
-    execution: ScenarioExecution | None = None
-    limitations: list[str] = []
-    if analysis_status == "executed":
-        try:
-            if selected == "lost-response":
-                execution, execution_limits = _execute_lost_response(
-                    hypothesis,
-                    options,
-                    path,
-                    execution_timeout,
-                    execution_timeout_provenance,
-                )
-            elif selected == "retryable-error":
-                assert retry_statuses is not None
-                assert retry_provenance is not None
-                assert server_error_status is not None
-                assert server_error_provenance is not None
-                execution, execution_limits = _execute_retryable_error(
-                    hypothesis,
-                    options,
-                    path,
-                    retry_statuses,
-                    retry_provenance,
-                    server_error_status,
-                    server_error_provenance,
-                    execution_timeout,
-                    execution_timeout_provenance,
-                )
-            else:
-                raise AnalysisUsageError("no runnable scenario was selected")
-            limitations.extend(execution_limits)
-        except RuntimeExecutionError as exc:
-            failure = f"runtime execution failed: {exc}"
-            readiness = ScenarioReadiness(
-                selected,
-                False,
-                _dedupe((failure, *readiness.blockers)),
-                hypothesis.unknowns,
-            )
-            analysis_status = "not_runnable"
-            execution = None
-            limitations.append(failure)
-
-    if analysis_status == "unsupported_input":
-        limitations.append(
-            "No runtime scenario was executed because the source is "
-            "unsupported or has no recognized requests call."
-        )
-    elif analysis_status == "not_runnable" and not execution:
-        limitations.extend(
-            (
-                "No runtime scenario was executed because required facts or "
-                "the runtime execution contract were unresolved.",
-                "The analyzed source was not substituted with the bundled "
-                "reference client.",
-            )
-        )
-        if options.scenario == "auto":
-            limitations.append(
-                "Automatic selection currently supports only a runnable "
-                "lost-response hypothesis; specify a scenario explicitly."
-            )
-
-    return build_report(
-        source_file=str(path),
-        requested_scenario=options.scenario,
-        extraction=extraction,
-        hypothesis=hypothesis,
-        readiness=readiness,
-        execution=execution,
-        analysis_status=analysis_status,
-        limitations=limitations,
-        llm_fallback=llm_diagnostics,
-        fact_provenance=llm_result.fact_provenance,
+    return AnalysisSettings(
+        retry_statuses=retry_statuses,
+        retry_provenance=retry_provenance,
+        server_error_status=server_error_status,
+        server_error_provenance=server_error_provenance,
+        execution_timeout=execution_timeout,
+        execution_timeout_provenance=execution_timeout_provenance,
     )
 
 
@@ -253,7 +381,11 @@ def _validate_options(options: AnalysisOptions) -> None:
                 "retryable-error"
             )
     for status in options.retry_statuses or ():
-        if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status <= 599:
+        if (
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 400 <= status <= 599
+        ):
             raise AnalysisUsageError(
                 "--retry-status values must be HTTP error statuses (400-599)"
             )

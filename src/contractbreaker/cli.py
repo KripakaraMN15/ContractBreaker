@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -33,6 +34,13 @@ from .report import (
     write_report,
 )
 from .version import __version__
+from .workflow import (
+    SUPPORTED_WORKFLOW_SCENARIOS,
+    WorkflowRequest,
+    render_workflow_text,
+    run_workflow,
+    workflow_exit_code,
+)
 
 _ANALYZE_EPILOG = """analyze exit codes:
   0  analysis completed: not_reproduced
@@ -49,7 +57,17 @@ _BENCHMARK_EPILOG = """benchmark exit codes:
   3  invalid CLI arguments
 """
 
-_TOP_LEVEL_EPILOG = _BENCHMARK_EPILOG + "\n\n" + _ANALYZE_EPILOG
+_WORKFLOW_EPILOG = """workflow exit codes:
+  0  executed; runtime verdict not_reproduced
+  1  executed; runtime verdict confirmed
+  2  planned, approval required, not runnable, or inconclusive
+  3  invalid or underspecified request
+  4  unsupported request or input (including unsupported source)
+"""
+
+_TOP_LEVEL_EPILOG = (
+    _WORKFLOW_EPILOG + "\n\n" + _BENCHMARK_EPILOG + "\n\n" + _ANALYZE_EPILOG
+)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -210,6 +228,95 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="write the benchmark JSON report to this file as well",
     )
+
+    workflow_parser = subparsers.add_parser(
+        "workflow",
+        help="interpret a reliability request, plan, and optionally execute",
+        description=(
+            "Interpret a natural-language reliability request, analyze the "
+            "source, validate readiness, and execute only with explicit "
+            "approval. Plan-only mode never executes the analyzed client."
+        ),
+        epilog=_WORKFLOW_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    workflow_parser.add_argument(
+        "--request",
+        default="",
+        help=(
+            "natural-language reliability request to interpret; optional when "
+            "--scenario and --source are both provided"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--source",
+        type=Path,
+        help=(
+            "target Python client file; may also be a .py path named in the "
+            "request text"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--scenario",
+        choices=SUPPORTED_WORKFLOW_SCENARIOS,
+        help="explicit scenario override instead of interpreting the request text",
+    )
+    workflow_parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="produce a plan and blockers without executing the client",
+    )
+    workflow_parser.add_argument(
+        "--approve",
+        action="store_true",
+        help="explicitly approve execution of a runnable scenario",
+    )
+    workflow_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="stdout format (default: text)",
+    )
+    workflow_parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the workflow JSON document to this file as well",
+    )
+    workflow_parser.add_argument(
+        "--llm-fallback",
+        action="store_true",
+        help=(
+            "opt in to the bounded OpenAI fallback for extraction and, when "
+            "needed, request interpretation and explanation"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--server-idempotency",
+        choices=SUPPORTED_SERVER_IDEMPOTENCY,
+        default=None,
+        help="explicit server idempotency constraint",
+    )
+    workflow_parser.add_argument(
+        "--retry-status",
+        dest="retry_statuses",
+        action="append",
+        type=_http_error_status,
+        help=(
+            "retryable HTTP status for the retryable-error scenario; "
+            "repeatable"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--server-error-status",
+        type=_http_error_status,
+        help="status returned by the retryable-error scenario server",
+    )
+    workflow_parser.add_argument(
+        "--execution-timeout",
+        type=float,
+        default=None,
+        help="maximum seconds for isolated client execution (default: 10)",
+    )
     return parser
 
 
@@ -221,6 +328,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "benchmark":
         return _run_benchmark_command(args)
+    if args.command == "workflow":
+        return _run_workflow_command(args)
     if args.command != "analyze":
         parser.error("a command is required")
 
@@ -297,3 +406,51 @@ def _run_benchmark_command(args: argparse.Namespace) -> int:
         print(render_benchmark_text(report))
 
     return benchmark_exit_code(report)
+
+def _run_workflow_command(args: argparse.Namespace) -> int:
+    if not args.request.strip() and not (args.scenario and args.source):
+        print(
+            "error: --request is required unless --scenario and --source are "
+            "both provided",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID_ARGS
+    state = run_workflow(
+        WorkflowRequest(
+            request=args.request,
+            source=args.source,
+            scenario=args.scenario,
+            retry_statuses=(
+                tuple(args.retry_statuses)
+                if args.retry_statuses is not None
+                else None
+            ),
+            server_idempotency=args.server_idempotency,
+            server_error_status=args.server_error_status,
+            execution_timeout=args.execution_timeout,
+            llm_fallback=args.llm_fallback,
+            approved=args.approve,
+            plan_only=args.plan_only,
+        )
+    )
+
+    document = state.snapshot()
+    if args.output is not None:
+        try:
+            args.output.write_text(
+                json.dumps(document, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            print(
+                f"error: could not write workflow report to {args.output}: {exc}",
+                file=sys.stderr,
+            )
+            return EXIT_UNSUPPORTED_INPUT
+
+    if args.format == "json":
+        sys.stdout.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
+    else:
+        print(render_workflow_text(state))
+
+    return workflow_exit_code(state)

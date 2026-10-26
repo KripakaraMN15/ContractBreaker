@@ -171,11 +171,31 @@ class LLMResponse:
     request_id: str | None = None
 
 
+@dataclass(frozen=True)
+class JSONCompletion:
+    """A schema-constrained JSON completion and its usage metadata."""
+
+    data: dict[str, Any]
+    model: str
+    usage: LLMUsage | None
+    request_id: str | None = None
+
+
 class LLMClient(Protocol):
     model: str
 
     def extract(self, request: LLMRequest) -> LLMResponse:
         """Return structured proposals for the supplied request."""
+
+    def complete_json(
+        self,
+        *,
+        system: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> JSONCompletion:
+        """Return a schema-constrained JSON completion."""
 
 
 class OpenAILLMClient:
@@ -224,16 +244,18 @@ class OpenAILLMClient:
                 f"{type(exc).__name__}: {str(exc)[:200]}",
             ) from exc
 
-    def extract(self, request: LLMRequest) -> LLMResponse:
-        payload = {
-            "filename": request.filename,
-            "source_excerpt_with_line_numbers": request.excerpt,
-            "unresolved_facts": list(request.unresolved),
-            "allowed_fact_types": list(request.allowed_fact_types),
-            "constraints": list(request.constraints),
-        }
+    def complete_json(
+        self,
+        *,
+        system: str,
+        payload: dict[str, Any],
+        schema: dict[str, Any],
+        schema_name: str,
+    ) -> JSONCompletion:
+        """Return a schema-constrained JSON completion from the model."""
+
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": json.dumps(payload, sort_keys=True),
@@ -249,9 +271,9 @@ class OpenAILLMClient:
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                        "name": "contractbreaker_extraction",
+                        "name": schema_name,
                         "strict": True,
-                        "schema": _PROPOSAL_SCHEMA,
+                        "schema": schema,
                     },
                 },
             )
@@ -267,7 +289,7 @@ class OpenAILLMClient:
             refusal = getattr(message, "refusal", None)
             if refusal:
                 raise LLMInvalidOutput(
-                    "refusal", "model refused the extraction request"
+                    "refusal", "model refused the structured request"
                 )
             content = message.content
             if not isinstance(content, str) or not content.strip():
@@ -283,7 +305,33 @@ class OpenAILLMClient:
                 f"could not parse structured output: {type(exc).__name__}",
             ) from exc
 
-        if not isinstance(parsed, dict) or set(parsed) != {"proposals"}:
+        if not isinstance(parsed, dict):
+            raise LLMInvalidOutput(
+                "invalid_output", "structured output must be a JSON object"
+            )
+        return JSONCompletion(
+            data=parsed,
+            model=getattr(response, "model", self.model) or self.model,
+            usage=_usage_from_response(response),
+            request_id=getattr(response, "id", None) or None,
+        )
+
+    def extract(self, request: LLMRequest) -> LLMResponse:
+        payload = {
+            "filename": request.filename,
+            "source_excerpt_with_line_numbers": request.excerpt,
+            "unresolved_facts": list(request.unresolved),
+            "allowed_fact_types": list(request.allowed_fact_types),
+            "constraints": list(request.constraints),
+        }
+        completion = self.complete_json(
+            system=_SYSTEM_PROMPT,
+            payload=payload,
+            schema=_PROPOSAL_SCHEMA,
+            schema_name="contractbreaker_extraction",
+        )
+        parsed = completion.data
+        if set(parsed) != {"proposals"}:
             raise LLMInvalidOutput(
                 "invalid_output", "structured output has invalid top-level fields"
             )
@@ -294,13 +342,11 @@ class OpenAILLMClient:
             raise LLMInvalidOutput(
                 "invalid_output", "structured output has an invalid proposals list"
             )
-
-        usage = _usage_from_response(response)
         return LLMResponse(
             proposals=tuple(proposals),
-            model=getattr(response, "model", self.model) or self.model,
-            usage=usage,
-            request_id=getattr(response, "id", None) or None,
+            model=completion.model,
+            usage=completion.usage,
+            request_id=completion.request_id,
         )
 
 

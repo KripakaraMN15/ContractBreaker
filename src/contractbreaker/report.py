@@ -57,24 +57,20 @@ class ScenarioExecution:
     report: Report
 
 
-def build_report(
+def build_analysis_snapshot(
     *,
-    source_file: str,
-    requested_scenario: str,
     extraction: ExtractionResult,
     hypothesis: ClientHypothesis,
     readiness: ScenarioReadiness,
-    execution: ScenarioExecution | None,
-    analysis_status: str,
-    limitations: Iterable[str] = (),
     llm_fallback: dict[str, Any] | None = None,
     fact_provenance: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Build the stable JSON-native report dictionary."""
+    """Serialize the static-analysis part of a report for reuse.
 
-    selected_scenario = (
-        execution.scenario if execution is not None else readiness.scenario
-    )
+    The workflow layer reuses this snapshot instead of re-serializing the
+    extraction and hypothesis models.
+    """
+
     extraction_dict = _jsonable(extraction)
     extraction_dict["provenance"] = "static_extraction"
 
@@ -104,6 +100,36 @@ def build_report(
     hypothesis_dict["llm_fallback"] = (
         llm_fallback if llm_fallback is not None else _disabled_llm_fallback()
     )
+    return {"extraction": extraction_dict, "hypothesis": hypothesis_dict}
+
+
+def build_report(
+    *,
+    source_file: str,
+    requested_scenario: str,
+    extraction: ExtractionResult,
+    hypothesis: ClientHypothesis,
+    readiness: ScenarioReadiness,
+    execution: ScenarioExecution | None,
+    analysis_status: str,
+    limitations: Iterable[str] = (),
+    llm_fallback: dict[str, Any] | None = None,
+    fact_provenance: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the stable JSON-native report dictionary."""
+
+    selected_scenario = (
+        execution.scenario if execution is not None else readiness.scenario
+    )
+    snapshot = build_analysis_snapshot(
+        extraction=extraction,
+        hypothesis=hypothesis,
+        readiness=readiness,
+        llm_fallback=llm_fallback,
+        fact_provenance=fact_provenance,
+    )
+    extraction_dict = snapshot["extraction"]
+    hypothesis_dict = snapshot["hypothesis"]
 
     if execution is None:
         reason = (

@@ -115,6 +115,71 @@ Options:
 - `--llm-fallback` opts in to the OpenAI fallback for unresolved extraction
   facts. It may make a paid API request. See the LLM fallback section below.
 
+## Workflow (milestone 7)
+
+`contractbreaker workflow` adds an evidence-driven orchestration layer on top of
+the existing pipeline. It interprets a request, analyzes the source, validates
+readiness, requires approval, executes only if allowed, and explains the
+evidence.
+
+```bash
+# Inspect a request and produce a plan. Never executes the client.
+contractbreaker workflow \
+  --request "check for duplicate payments after a lost response" \
+  --source path/to/client.py \
+  --plan-only
+
+# Plan with JSON output (no execution).
+contractbreaker workflow --request "retry on a 503 server error" \
+  --source path/to/client.py --plan-only --format json
+
+# Execute only after explicit approval.
+contractbreaker workflow --request "check a lost response" \
+  --source path/to/client.py --approve
+
+# Structured input without free text, executed with approval.
+contractbreaker workflow --scenario lost-response \
+  --source path/to/client.py --approve
+```
+
+Workflow stages, in order:
+
+1. `request_interpretation` — resolves scenario, source, and explicit
+   constraints. Deterministic keyword mapping is preferred. Both scenarios
+   mentioned → blocked as ambiguous. No scenario → blocked as underspecified
+   unless an optional LLM proposes one with a phrase copied verbatim from the
+   request. Unsupported topics (circuit breakers, rate limits, DNS, gRPC,
+   WebSockets, databases, connection resets) are rejected without guessing.
+2. `source_analysis` — deterministic extractor, then the optional bounded LLM
+   fallback, with provenance, evidence validation, and conflicts preserved.
+3. `readiness_validation` — existing hypothesis and runtime-contract checks.
+   Blockers stop the workflow before execution.
+4. `approval` — execution requires `--approve`; `--plan-only` always stops.
+5. `execution` — the existing subprocess runtime and scenario verifier.
+6. `explanation` — deterministic evidence summary, optionally replaced by an
+   LLM summary that is validated against the report verdict and observed
+   side-effect count. Invalid summaries are discarded and the deterministic
+   summary is used.
+
+The workflow JSON document adds `workflow_schema_version`, `outcome`,
+`request`, `approval`, `stages`, `analysis_snapshot`, `analysis` (the existing
+versioned report when executed), `verdict`, `explanation`, `explanation_meta`,
+`limitations`, and `errors`. The existing analysis report contract is unchanged.
+
+Workflow exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Executed; runtime verdict `not_reproduced`. |
+| `1` | Executed; runtime verdict `confirmed`. |
+| `2` | Planned, approval required, not runnable, or inconclusive. |
+| `3` | Invalid or underspecified request. |
+| `4` | Unsupported request or input, including unsupported source. |
+
+A plan-only run and an unapproved run both exit `2`, never `0`. Only the
+runtime verifier assigns the workflow verdict; the orchestrator and the
+optional summarizer cannot change it.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -556,7 +621,7 @@ worker works outside the repository root.
 
 ## Tests
 
-The complete suite currently collects 129 tests: 128 pass and the optional paid
+The complete suite currently collects 161 tests: 160 pass and the optional paid
 live OpenAI smoke test is skipped by default.
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
@@ -654,6 +719,20 @@ live OpenAI smoke test is skipped by default.
 - LLM-filled facts cannot force a `confirmed` verdict.
 - Model configuration and token-cost estimation.
 - Benchmark prompts contain no labels or expected verdicts.
+
+`tests/test_workflow.py` adds 32 orchestration cases:
+
+- Deterministic scenario selection, structured overrides, and source resolution.
+- Ambiguous, underspecified, and unsupported requests are blocked.
+- Plan-only and unapproved runs never execute the client.
+- Blocked, unsupported, and nested clients never reach execution.
+- Conflicting LLM facts stay visible and do not force execution.
+- Approved buggy/fixed and retryable-error runs preserve the verifier verdict.
+- Execution failures and incomplete traces never become `confirmed`.
+- LLM interpretation requires a verbatim phrase from the request.
+- The summarizer cannot change the verdict or invent side-effect counts.
+- LLM-disabled workflows never construct an LLM client.
+- Workflow JSON is JSON-native and never embeds the analyzed source text.
 
 `tests/test_llm_live.py` is skipped unless `CONTRACTBREAKER_LIVE_LLM=1` and
 credentials are present.
@@ -903,6 +982,16 @@ or generalization beyond this synthetic dataset.
   numbers use a clearly labeled offline fake provider. The live smoke test is
   skipped unless explicitly enabled with credentials. Offline fake results are
   not evidence of OpenAI model accuracy or improvement.
+- **Workflow scope is intentionally narrow.** Request interpretation supports
+  two scenarios, a small unsupported-topic list, and a `.py` source path. It is
+  not a general task planner and does not orchestrate multiple agents.
+- **Workflow interpretation can still be wrong.** Keyword mapping is
+  deterministic and conservative, but a request can mention a scenario without
+  meaning it. Inspect the plan and blockers before approving execution.
+- **LLM workflow stages send request text, not just source.** When
+  `--llm-fallback` is enabled, the request text may be sent for interpretation
+  and the report payload may be sent for summarization. Neither stage can change
+  the verdict; both can be disabled.
 - **Reports are scenario evidence, not a security audit.** Unsupported patterns,
   unknown facts, and non-runnable hypotheses are reported as such and can never
   become `confirmed`.
