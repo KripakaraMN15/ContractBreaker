@@ -23,9 +23,16 @@ EXIT_INVALID_ARGS = 3
 EXIT_UNSUPPORTED_INPUT = 4
 
 _BASE_LIMITATIONS = (
-    "Runtime scenarios execute the bundled reference harness, not the analyzed source file.",
-    "Fault injection is simulated in-process after server execution, not at the network layer.",
-    "Static extraction supports only the documented requests patterns.",
+    "The analyzed client is executed in a subprocess against an in-process "
+    "WSGI test service; this is isolation, not a hardened security sandbox.",
+    "All requests traffic is routed to the test service and socket access is "
+    "blocked; direct network clients are unsupported.",
+    "Fault injection is simulated in-process after server execution, not at "
+    "the network layer.",
+    "Static extraction and runtime execution support only the documented "
+    "module-level requests client patterns.",
+    "Static retry and timeout values are recorded as expectations; the analyzed "
+    "client's own code controls actual attempts and request timeouts.",
 )
 
 

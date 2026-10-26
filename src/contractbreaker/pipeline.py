@@ -1,8 +1,8 @@
 """End-to-end analysis pipeline used by the CLI.
 
-The pipeline is deliberately the only place that connects extraction,
-hypothesis generation, scenario execution, and verification. The CLI only
-parses arguments, renders output, writes files, and maps reports to exit codes.
+The pipeline connects extraction, hypothesis generation, runtime execution of
+the analyzed client, and causal verification. It never substitutes the bundled
+reference client for an analyzed source.
 """
 
 from __future__ import annotations
@@ -10,15 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-from examples.payments.retryable_error_scenario import (
-    RetryableErrorScenarioConfig,
-    run_retryable_error_scenario,
-)
-from examples.payments.scenario import (
-    PaymentScenarioConfig,
-    run_payment_scenario,
-)
+from urllib.parse import urlparse
 
 from .ast_extractor import extract_from_source
 from .extraction import ExtractionStatus, FactStatus
@@ -26,9 +18,12 @@ from .hypothesis import (
     ClientHypothesis,
     HypothesisNotRunnable,
     hypothesize_from_extraction,
-    recommend_scenario,
 )
 from .report import ScenarioExecution, ScenarioReadiness, build_report
+from .retryable_error_verifier import verify_retryable_error_duplicate
+from .runtime import RuntimeExecutionError, run_analyzed_client
+from .runtime_contract import RuntimeContract, check_runtime_contract
+from .verifier import verify_duplicate_side_effects
 
 SUPPORTED_SCENARIOS = ("auto", "lost-response", "retryable-error")
 SUPPORTED_SERVER_IDEMPOTENCY = ("auto", "on", "off")
@@ -37,6 +32,7 @@ _UNSUPPORTED_EXTRACTION = {
     ExtractionStatus.NO_HTTP_CALLS,
     ExtractionStatus.UNSUPPORTED,
 }
+_DEFAULT_EXECUTION_TIMEOUT = 10.0
 
 
 class AnalysisUsageError(ValueError):
@@ -56,10 +52,11 @@ class AnalysisOptions:
     server_idempotency: str = "auto"
     retry_statuses: tuple[int, ...] | None = None
     server_error_status: int | None = None
+    execution_timeout: float | None = None
 
 
 def analyze(options: AnalysisOptions) -> dict[str, Any]:
-    """Run extraction, readiness checks, the scenario, and the verifier."""
+    """Extract, configure, execute the analyzed client, and verify its trace."""
 
     _validate_options(options)
     path = Path(options.source)
@@ -72,6 +69,7 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
 
     extraction = extract_from_source(source, filename=str(path))
     hypothesis = hypothesize_from_extraction(extraction)
+    contract = check_runtime_contract(source, extraction)
     unsupported_extraction = extraction.status in _UNSUPPORTED_EXTRACTION
 
     retry_statuses: tuple[int, ...] | None = None
@@ -92,8 +90,15 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
             server_error_status = options.server_error_status
             server_error_provenance = "cli"
 
+    if options.execution_timeout is None:
+        execution_timeout = _DEFAULT_EXECUTION_TIMEOUT
+        execution_timeout_provenance = "scenario_default"
+    else:
+        execution_timeout = float(options.execution_timeout)
+        execution_timeout_provenance = "cli"
+
     selected, readiness = _select_scenario(
-        options, hypothesis, unsupported_extraction
+        options, hypothesis, unsupported_extraction, contract
     )
     if unsupported_extraction:
         readiness = ScenarioReadiness(
@@ -116,35 +121,59 @@ def analyze(options: AnalysisOptions) -> dict[str, Any]:
     execution: ScenarioExecution | None = None
     limitations: list[str] = []
     if analysis_status == "executed":
-        if selected == "lost-response":
-            execution, execution_limits = _execute_lost_response(
-                hypothesis, options
+        try:
+            if selected == "lost-response":
+                execution, execution_limits = _execute_lost_response(
+                    hypothesis,
+                    options,
+                    path,
+                    execution_timeout,
+                    execution_timeout_provenance,
+                )
+            elif selected == "retryable-error":
+                assert retry_statuses is not None
+                assert retry_provenance is not None
+                assert server_error_status is not None
+                assert server_error_provenance is not None
+                execution, execution_limits = _execute_retryable_error(
+                    hypothesis,
+                    options,
+                    path,
+                    retry_statuses,
+                    retry_provenance,
+                    server_error_status,
+                    server_error_provenance,
+                    execution_timeout,
+                    execution_timeout_provenance,
+                )
+            else:
+                raise AnalysisUsageError("no runnable scenario was selected")
+            limitations.extend(execution_limits)
+        except RuntimeExecutionError as exc:
+            failure = f"runtime execution failed: {exc}"
+            readiness = ScenarioReadiness(
+                selected,
+                False,
+                _dedupe((failure, *readiness.blockers)),
+                hypothesis.unknowns,
             )
-        elif selected == "retryable-error":
-            assert retry_statuses is not None
-            assert retry_provenance is not None
-            assert server_error_status is not None
-            assert server_error_provenance is not None
-            execution, execution_limits = _execute_retryable_error(
-                hypothesis,
-                options,
-                retry_statuses,
-                retry_provenance,
-                server_error_status,
-                server_error_provenance,
-            )
-        else:
-            raise AnalysisUsageError("no runnable scenario was selected")
-        limitations.extend(execution_limits)
-    elif analysis_status == "unsupported_input":
+            analysis_status = "not_runnable"
+            execution = None
+            limitations.append(failure)
+
+    if analysis_status == "unsupported_input":
         limitations.append(
             "No runtime scenario was executed because the source is "
             "unsupported or has no recognized requests call."
         )
-    else:
-        limitations.append(
-            "No runtime scenario was executed because required facts for the "
-            "requested scenario were unresolved."
+    elif analysis_status == "not_runnable" and not execution:
+        limitations.extend(
+            (
+                "No runtime scenario was executed because required facts or "
+                "the runtime execution contract were unresolved.",
+                "The analyzed source was not substituted with the bundled "
+                "reference client.",
+            )
         )
         if options.scenario == "auto":
             limitations.append(
@@ -171,9 +200,7 @@ def _validate_options(options: AnalysisOptions) -> None:
             f"choose one of {', '.join(SUPPORTED_SCENARIOS)}"
         )
     if options.server_idempotency not in SUPPORTED_SERVER_IDEMPOTENCY:
-        raise AnalysisUsageError(
-            "server-idempotency must be auto, on, or off"
-        )
+        raise AnalysisUsageError("server-idempotency must be auto, on, or off")
     if options.scenario != "retryable-error":
         if options.retry_statuses is not None:
             raise AnalysisUsageError(
@@ -185,7 +212,7 @@ def _validate_options(options: AnalysisOptions) -> None:
                 "retryable-error"
             )
     for status in options.retry_statuses or ():
-        if not isinstance(status, int) or not 400 <= status <= 599:
+        if not isinstance(status, int) or isinstance(status, bool) or not 400 <= status <= 599:
             raise AnalysisUsageError(
                 "--retry-status values must be HTTP error statuses (400-599)"
             )
@@ -197,18 +224,30 @@ def _validate_options(options: AnalysisOptions) -> None:
         raise AnalysisUsageError(
             "--server-error-status must be an HTTP error status (400-599)"
         )
+    if options.execution_timeout is not None and (
+        isinstance(options.execution_timeout, bool)
+        or not isinstance(options.execution_timeout, (int, float))
+        or options.execution_timeout <= 0
+    ):
+        raise AnalysisUsageError("--execution-timeout must be a positive number")
 
 
 def _select_scenario(
     options: AnalysisOptions,
     hypothesis: ClientHypothesis,
     unsupported_extraction: bool,
+    contract: RuntimeContract,
 ) -> tuple[str | None, ScenarioReadiness]:
+    contract_blockers = () if contract.supported else contract.blockers
     if options.scenario == "auto":
         lost = _lost_response_readiness(hypothesis)
-        if not unsupported_extraction and lost.runnable:
+        if (
+            not unsupported_extraction
+            and contract.supported
+            and lost.runnable
+        ):
             return "lost-response", lost
-        blockers = list(lost.blockers)
+        blockers = [*lost.blockers, *contract_blockers]
         if unsupported_extraction:
             blockers.insert(
                 0,
@@ -225,20 +264,24 @@ def _select_scenario(
             hypothesis.unknowns,
         )
     if options.scenario == "lost-response":
-        return "lost-response", _lost_response_readiness(hypothesis)
-    return "retryable-error", _retryable_error_readiness(hypothesis)
+        return "lost-response", _merge_contract(
+            _lost_response_readiness(hypothesis), contract
+        )
+    return "retryable-error", _merge_contract(
+        _retryable_error_readiness(hypothesis), contract
+    )
 
 
 def _lost_response_readiness(hypothesis: ClientHypothesis) -> ScenarioReadiness:
-    if hypothesis.scenario_ready:
-        return ScenarioReadiness(
-            "lost-response", True, (), hypothesis.unknowns
-        )
-    blockers = hypothesis.blockers or (
-        "hypothesis is not runnable for the lost-response scenario",
-    )
+    blockers = list(hypothesis.blockers)
+    path_blocker = _endpoint_path_blocker(hypothesis)
+    if path_blocker is not None:
+        blockers.append(path_blocker)
     return ScenarioReadiness(
-        "lost-response", False, blockers, hypothesis.unknowns
+        "lost-response",
+        not blockers,
+        _dedupe(tuple(blockers)),
+        hypothesis.unknowns,
     )
 
 
@@ -253,9 +296,13 @@ def _retryable_error_readiness(
     if hypothesis.method.status is not FactStatus.KNOWN:
         blockers.append("HTTP method is unknown")
     elif hypothesis.method.value != "POST":
-        blockers.append("reference scenario only models POST payments")
+        blockers.append("runtime payment test service only models POST")
     if hypothesis.endpoint.status is not FactStatus.KNOWN:
         blockers.append("endpoint is not a known string literal")
+    else:
+        path_blocker = _endpoint_path_blocker(hypothesis)
+        if path_blocker is not None:
+            blockers.append(path_blocker)
     if hypothesis.timeout.status is not FactStatus.KNOWN:
         blockers.append("timeout is not a concrete literal")
     elif not isinstance(hypothesis.timeout.value, (int, float)) or (
@@ -282,68 +329,40 @@ def _retryable_error_readiness(
     )
 
 
+def _endpoint_path_blocker(hypothesis: ClientHypothesis) -> str | None:
+    if hypothesis.endpoint.status is not FactStatus.KNOWN:
+        return None
+    endpoint = hypothesis.endpoint.value
+    if not isinstance(endpoint, str):
+        return "endpoint is not a string literal"
+    path = urlparse(endpoint).path or "/"
+    if path != "/payments":
+        return (
+            "runtime payment test service only models the /payments path; "
+            f"source endpoint path is {path}"
+        )
+    return None
+
+
+def _merge_contract(
+    readiness: ScenarioReadiness, contract: RuntimeContract
+) -> ScenarioReadiness:
+    if contract.supported:
+        return readiness
+    return ScenarioReadiness(
+        readiness.scenario,
+        False,
+        _dedupe((*contract.blockers, *readiness.blockers)),
+        readiness.unknowns,
+    )
+
+
 def _execute_lost_response(
     hypothesis: ClientHypothesis,
     options: AnalysisOptions,
-) -> tuple[ScenarioExecution, tuple[str, ...]]:
-    try:
-        recommendation = recommend_scenario(hypothesis)
-        server_idempotency, server_provenance = _resolve_server_idempotency(
-            options.server_idempotency, hypothesis
-        )
-    except HypothesisNotRunnable as exc:
-        raise AnalysisUsageError(str(exc)) from exc
-
-    config = PaymentScenarioConfig(
-        server_supports_idempotency=server_idempotency,
-        client_sends_idempotency_key=(
-            recommendation.client_sends_idempotency_key
-        ),
-        max_retries=recommendation.max_retries,
-        drop_response_on_attempts=frozenset({1}),
-        request_timeout=recommendation.request_timeout,
-    )
-    settings = {
-        "server_supports_idempotency": server_idempotency,
-        "client_sends_idempotency_key": (
-            recommendation.client_sends_idempotency_key
-        ),
-        "max_retries": recommendation.max_retries,
-        "drop_response_on_attempts": [1],
-        "request_timeout": recommendation.request_timeout,
-    }
-    provenance = {
-        "server_supports_idempotency": server_provenance,
-        "client_sends_idempotency_key": "derived_from_extraction",
-        "max_retries": "derived_from_extraction",
-        "drop_response_on_attempts": "scenario_default",
-        "request_timeout": "derived_from_extraction",
-    }
-    execution = ScenarioExecution(
-        scenario="lost-response",
-        runner="run_payment_scenario",
-        settings=settings,
-        provenance=provenance,
-        report=run_payment_scenario(config),
-    )
-    limitations: list[str] = [
-        "Lost response is simulated after the in-process server commits.",
-    ]
-    if server_provenance == "derived_from_extraction":
-        limitations.append(
-            "Server idempotency was inferred from the client's extracted "
-            "idempotency-key facts; override with --server-idempotency."
-        )
-    return execution, tuple(limitations)
-
-
-def _execute_retryable_error(
-    hypothesis: ClientHypothesis,
-    options: AnalysisOptions,
-    retry_statuses: tuple[int, ...],
-    retry_provenance: str,
-    server_error_status: int,
-    server_error_provenance: str,
+    source_path: Path,
+    execution_timeout: float,
+    execution_timeout_provenance: str,
 ) -> tuple[ScenarioExecution, tuple[str, ...]]:
     try:
         server_idempotency, server_provenance = _resolve_server_idempotency(
@@ -362,40 +381,135 @@ def _execute_retryable_error(
             "retry count or timeout is not a concrete value"
         )
 
-    config = RetryableErrorScenarioConfig(
+    runtime_result = run_analyzed_client(
+        source=source_path,
+        scenario="lost-response",
         server_supports_idempotency=server_idempotency,
-        client_sends_idempotency_key=client_sends_key,
-        retry_statuses=frozenset(retry_statuses),
-        max_retries=retry_count,
-        request_timeout=float(timeout),
-        server_error_status=server_error_status,
+        retry_statuses=(),
+        server_error_status=503,
+        policy_max_retries=retry_count,
+        execution_timeout_seconds=execution_timeout,
+    )
+    verified = verify_duplicate_side_effects(
+        runtime_result.events,
+        side_effects=runtime_result.observed_side_effects,
     )
     settings = {
+        "entrypoint": "module",
+        "server_supports_idempotency": server_idempotency,
+        "client_sends_idempotency_key": client_sends_key,
+        "max_retries": retry_count,
+        "drop_response_on_attempts": [1],
+        "request_timeout": float(timeout),
+        "execution_timeout_seconds": execution_timeout,
+        "operation_id_source": "harness_if_absent",
+    }
+    provenance = {
+        "entrypoint": "scenario_default",
+        "server_supports_idempotency": server_provenance,
+        "client_sends_idempotency_key": "derived_from_extraction",
+        "max_retries": "derived_from_extraction",
+        "drop_response_on_attempts": "scenario_default",
+        "request_timeout": "derived_from_extraction",
+        "execution_timeout_seconds": execution_timeout_provenance,
+        "operation_id_source": "scenario_default",
+    }
+    execution = ScenarioExecution(
+        scenario="lost-response",
+        runner="runtime_subprocess",
+        settings=settings,
+        provenance=provenance,
+        report=verified,
+    )
+    limitations: list[str] = [
+        "Analyzed client executed in a subprocess; the lost response is "
+        "simulated after the in-process server commits.",
+        "The harness assigns X-Operation-Id when the client does not send one.",
+    ]
+    if server_provenance == "derived_from_extraction":
+        limitations.append(
+            "Server idempotency was inferred from the client's extracted "
+            "idempotency-key facts; override with --server-idempotency."
+        )
+    return execution, tuple(limitations)
+
+
+def _execute_retryable_error(
+    hypothesis: ClientHypothesis,
+    options: AnalysisOptions,
+    source_path: Path,
+    retry_statuses: tuple[int, ...],
+    retry_provenance: str,
+    server_error_status: int,
+    server_error_provenance: str,
+    execution_timeout: float,
+    execution_timeout_provenance: str,
+) -> tuple[ScenarioExecution, tuple[str, ...]]:
+    try:
+        server_idempotency, server_provenance = _resolve_server_idempotency(
+            options.server_idempotency, hypothesis
+        )
+    except HypothesisNotRunnable as exc:
+        raise AnalysisUsageError(str(exc)) from exc
+
+    client_sends_key = (
+        hypothesis.idempotency_key_present.status is FactStatus.KNOWN
+    )
+    retry_count = hypothesis.retry_count.value
+    timeout = hypothesis.timeout.value
+    if retry_count is None or timeout is None:
+        raise AnalysisUsageError(
+            "retry count or timeout is not a concrete value"
+        )
+
+    runtime_result = run_analyzed_client(
+        source=source_path,
+        scenario="retryable-error",
+        server_supports_idempotency=server_idempotency,
+        retry_statuses=retry_statuses,
+        server_error_status=server_error_status,
+        policy_max_retries=retry_count,
+        execution_timeout_seconds=execution_timeout,
+    )
+    verified = verify_retryable_error_duplicate(
+        runtime_result.events,
+        side_effects=runtime_result.observed_side_effects,
+    )
+    settings = {
+        "entrypoint": "module",
         "server_supports_idempotency": server_idempotency,
         "client_sends_idempotency_key": client_sends_key,
         "retry_statuses": list(retry_statuses),
+        "server_error_status": server_error_status,
         "max_retries": retry_count,
         "request_timeout": float(timeout),
-        "server_error_status": server_error_status,
+        "execution_timeout_seconds": execution_timeout,
+        "operation_id_source": "harness_if_absent",
     }
     provenance = {
+        "entrypoint": "scenario_default",
         "server_supports_idempotency": server_provenance,
         "client_sends_idempotency_key": "derived_from_extraction",
         "retry_statuses": retry_provenance,
+        "server_error_status": server_error_provenance,
         "max_retries": "derived_from_extraction",
         "request_timeout": "derived_from_extraction",
-        "server_error_status": server_error_provenance,
+        "execution_timeout_seconds": execution_timeout_provenance,
+        "operation_id_source": "scenario_default",
     }
     execution = ScenarioExecution(
         scenario="retryable-error",
-        runner="run_retryable_error_scenario",
+        runner="runtime_subprocess",
         settings=settings,
         provenance=provenance,
-        report=run_retryable_error_scenario(config),
+        report=verified,
     )
     limitations: list[str] = [
-        "Retryable status policy is supplied by CLI flags/defaults and is "
-        "not statically extracted from the source.",
+        "Analyzed client executed in a subprocess; the retryable status policy "
+        "is supplied by CLI flags/defaults.",
+        "The harness records a retry decision when a request follows a "
+        "configured retryable response.",
+        "The harness assigns X-Operation-Id when the client does not send one.",
         "Static retry-trigger facts are reported but are not used to infer "
         "the HTTP status retry policy.",
     ]
