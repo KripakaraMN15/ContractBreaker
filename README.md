@@ -3,9 +3,11 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 5. The CLI now executes the analyzed client itself in an
-> isolated subprocess for a narrow supported contract, then applies the existing
-> causal verifier. Static extraction and hypotheses never issue a verdict.
+> Status: milestone 6A. The CLI executes the analyzed client for a narrow
+> supported contract and a separate benchmark command scores labeled
+> development and held-out datasets. Static extraction and hypotheses never
+> issue a verdict. Benchmark results are synthetic and do not establish general
+> production accuracy.
 
 ## The problem
 
@@ -30,6 +32,9 @@ tests can all pass while this happens.
    replays, and the terminal outcome with explicit attempt ids.
 6. The existing verifier checks the ordered causal chain and reconciles commits
    with the observable side-effect ledger.
+7. `contractbreaker benchmark` runs labeled development and held-out datasets
+   through the same pipeline and scores extraction, runnability, and runtime
+   verification separately.
 
 No external network or LLM calls are involved. Faults are deterministic. UUIDs
 identify operations and keys, but they do not affect the verdict logic. The
@@ -438,7 +443,7 @@ worker works outside the repository root.
 
 ## Tests
 
-The complete suite currently contains 98 tests.
+The complete suite currently contains 106 tests.
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
 
@@ -509,6 +514,147 @@ The complete suite currently contains 98 tests.
 - An incomplete runtime trace is inconclusive.
 - Execution timeout maps to a structured failure.
 
+`tests/test_benchmark.py` adds 8 benchmark cases:
+
+- Known metric arithmetic and denominators.
+- Development/held-out CLI JSON, output files, and unsupported non-execution.
+- Labels cannot change the runtime verdict.
+- Per-case analysis errors are recorded, not omitted.
+- Missing/invalid datasets fail with exit `2`.
+- Missing `--dataset` is invalid CLI usage.
+- Dataset sources cannot escape their split directory.
+
+## Benchmark (milestone 6A)
+
+The benchmark is a small **synthetic** dataset, not evidence of general
+production accuracy. It contains a development split and a separately stored
+held-out split.
+
+### Dataset structure
+
+```text
+benchmark/
+  development/
+    manifest.json
+    dev_*.py
+  held_out/
+    manifest.json
+    held_*.py
+```
+
+Dataset name: `contractbreaker-synthetic`; dataset version: `1.0`.
+
+Each manifest case labels:
+
+- Inputs passed to the normal pipeline: scenario, server idempotency, retry
+  statuses, server error status, and execution timeout.
+- Expected extraction status and labeled facts.
+- Expected warning codes.
+- Expected runnability, whether execution should occur, verdict, and
+  side-effect count.
+
+Expected labels are **not** passed to `analyze`. The benchmark passes only the
+case inputs to the runtime pipeline, then scores the resulting report against
+the labels. This is tested by deliberately mislabeling a held-out case: the
+runtime still returns `confirmed`, and the benchmark records a mismatch.
+
+### Development versus held-out
+
+Development cases cover patterns used while building the extractor/runtime:
+explicit `for` retries, literal and unresolved timeouts, stable uuid keys,
+fresh keys, conditional headers, no-retry exception handling, 503 status
+checks, nested wrappers, and an unsupported `httpx` client.
+
+Held-out cases were authored after implementation and include patterns not used
+to tune the detector: `while` retries, a retry wrapper, a three-attempt loop
+with a `secrets` key, `>=500` status checks, a policy mismatch, a fresh key,
+a zero timeout, tenacity, and a parse error.
+
+During initial label verification, status-check cases were correctly classified
+as `extraction_status: partial` because retry triggers are unknown. One
+one-iteration no-retry case was clarified as verifier-`inconclusive` and moved
+from held-out to development. No extractor, runtime, report, or verifier logic
+was changed in response. This is a threat to validity and is disclosed rather
+than hidden.
+
+No independently sourced public client examples are included. The supported
+runtime contract is narrow, and a public example would need licensing,
+dependency, and version review. All benchmark results are therefore labeled
+synthetic.
+
+### Commands
+
+```bash
+# Human-readable summary.
+contractbreaker benchmark --dataset benchmark --format text
+
+# Machine-readable report, including labels and per-case outcomes.
+contractbreaker benchmark --dataset benchmark --format json
+
+# Write the JSON benchmark report to a file.
+contractbreaker benchmark --dataset benchmark --format json \
+  --output benchmark-report.json
+```
+
+Benchmark exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Every labeled case matched. |
+| `1` | Completed with one or more mismatches. |
+| `2` | Dataset or execution could not be completed. |
+| `3` | Invalid CLI arguments. |
+
+### Metric definitions
+
+All rates include an explicit numerator and denominator in JSON.
+
+- **Extraction status accuracy:** cases whose actual extraction status matches
+  the expected status, over all cases.
+- **Fact accuracy:** per labeled fact, matching status and value for `known`
+  facts or matching status for `absent`/`unknown`/`ambiguous`/`unsupported`.
+  Denominator: cases where that fact is labeled.
+- **Warning code accuracy:** cases whose extraction warning-code set matches
+  exactly, over all cases.
+- **Uncertainty accuracy:** expected unsupported extraction statuses plus fact
+  labels with status `unknown`, `ambiguous`, or `unsupported`, over that set.
+- **Unsupported input accuracy:** cases expected as `unsupported`,
+  `no_http_calls`, or `parse_error` whose extraction status matches.
+- **Runnability:** counts of correctly runnable, correctly blocked, incorrectly
+  allowed, and incorrectly blocked cases; accuracy is correct cases over all.
+- **Detection rate:** expected supported buggy cases (`runnable` and expected
+  `confirmed`) that actually return `confirmed`.
+- **False-positive rate:** expected supported fixed cases (`runnable` and
+  expected `not_reproduced`) that actually return `confirmed`.
+- **Side-effect accuracy:** cases with a non-null expected side-effect count
+  whose actual count matches.
+- **Inconclusive cases:** all cases whose actual verdict is `inconclusive`.
+- **Verdict accuracy:** expected verdict matched over all cases.
+- **Executed verdict accuracy:** expected verdict matched over cases that
+  actually executed; this measures verifier outcomes on real traces.
+- **Execution failures:** cases expected to execute that did not.
+- **Unexpected executions:** cases expected not to execute that did.
+- **Case errors:** cases where the analysis raised and the benchmark recorded an
+  error instead of omitting the case.
+
+### Current synthetic results
+
+All 13 development and 10 held-out labeled cases matched their expected
+labels.
+
+| Split | Cases | Status | Facts | Warnings | Uncertainty | Runnable/blocked | Incorrectly allowed | Detection | False positives | Side effects | Inconclusive |
+| --- | ---: | --- | --- | --- | --- | --- | ---: | --- | --- | --- | ---: |
+| Development | 13 | 13/13 | 12/12 each | 13/13 | 8/8 | 7/6 | 0 | 2/2 | 0/4 | 7/7 | 7 |
+| Held-out | 10 | 10/10 | 9/9 each | 10/10 | 4/4 | 4/6 | 0 | 1/1 | 0/3 | 4/4 | 6 |
+
+Held-out inconclusive cases: `held-lost-while-buggy`,
+`held-lost-retry-wrapper`, `held-retry-fresh-key`, `held-timeout-zero`,
+`held-unsupported-tenacity`, `held-parse-error`.
+
+These numbers demonstrate the benchmark pipeline and the current narrow
+contract. They do not establish broad extraction accuracy, production safety,
+or generalization beyond this synthetic dataset.
+
 ## Known limitations
 
 - **Simulated failures only.** The analyzed client really executes, but its
@@ -552,6 +698,17 @@ The complete suite currently contains 98 tests.
 - **The CLI analyzes one supplied file.** It does not perform arbitrary
   repository analysis, multi-file data flow, wrapper resolution, or package
   discovery.
+- **Benchmark results are synthetic and small.** The development and held-out
+  splits were authored by the same project, no independent public clients are
+  included, and the denominators are small (13 and 10 cases). A 100% synthetic
+  result is not a generalization claim. Label corrections made during the
+  initial benchmark run are disclosed in the benchmark section.
+- **Unsupported cases are excluded from detection denominators.** They count
+  toward extraction/blocking metrics and inconclusive counts, but are never
+  counted as successful bug detections.
+- **Benchmark labels are scoring-only.** The benchmark passes only case inputs
+  to the runtime pipeline; a dedicated test mislabels a case and confirms that
+  the runtime verdict does not change.
 - **Reports are scenario evidence, not a security audit.** Unsupported patterns,
   unknown facts, and non-runnable hypotheses are reported as such and can never
   become `confirmed`.
