@@ -3,9 +3,10 @@
 Deterministic detection of retry/timeout conflicts between an HTTP client and a
 service, backed by a causal event trace rather than a pass/fail assertion.
 
-> Status: milestone 2. The build verifies one response-loss scenario and adds a
-> narrow deterministic AST extractor for client retry, timeout, exception, and
-> idempotency-key facts.
+> Status: milestone 2.1. The build verifies one response-loss scenario, extracts
+> narrow client retry/timeout facts, and derives deterministic hypotheses that
+> can be mapped onto the reference scenario. Static extraction never issues a
+> verdict.
 
 ## The problem
 
@@ -88,6 +89,11 @@ through a variable reports `"unknown"`, and an explicit `timeout=None` reports
 - `requests.request("METHOD", ...)` with a literal method.
 - Tracked session objects created from `requests.Session()` and used as
   `session.get(...)`, including `with requests.Session() as session`.
+- Injected sessions with an explicit annotation, such as
+  `def __init__(self, session: requests.Session): self._session = session`,
+  followed by `self._session.post(...)`.
+- Conditional header mutations are retained but mark an `Idempotency-Key` as
+  `ambiguous`, because its presence depends on runtime state.
 - Literal numeric or `None` timeout values.
 - `for ... in range(...)` retry loops with literal or simply assigned integer
   bounds. `max_attempts` and the derived `retry_count` are separate facts.
@@ -116,6 +122,39 @@ ambiguous, or unsupported and no warning was raised. Files with recognized
 calls but unresolved details are `partial`; unrecognized HTTP libraries are
 `unsupported`; valid files with no recognized requests calls are
 `no_http_calls`.
+
+## Hypothesis generation
+
+`hypothesize_from_source`, `hypothesize_from_file`, and
+`hypothesize_from_extraction` convert extraction facts into a typed
+`ClientHypothesis`. The hypothesis records the HTTP method, endpoint, timeout,
+retry count, retry triggers, idempotency-key presence and reuse, all unresolved
+facts, and warnings.
+
+```python
+from contractbreaker import hypothesize_from_source, recommend_scenario
+
+hypothesis = hypothesize_from_source(source_text, filename="client.py")
+if hypothesis.scenario_ready:
+    recommendation = recommend_scenario(hypothesis)
+```
+
+A hypothesis is runnable only when the method, endpoint, positive timeout,
+retry count, timeout/connection trigger, and idempotency-key behavior are all
+resolved. Otherwise `scenario_ready` is false, `blockers` explains why, and
+`recommend_scenario` raises `HypothesisNotRunnable`. Static extraction has no
+verdict field; only the causal verifier can return `confirmed`.
+
+`examples/payments/scenario.py` provides `config_from_hypothesis`, which maps a
+runnable hypothesis onto the existing reference scenario. The end-to-end tests
+extract source, build a hypothesis, construct a scenario config, run the
+scenario, and assert the runtime verdict.
+
+The reference payment client is a deliberate partial example: its injected
+session is now recognized, but its f-string endpoint, `self._timeout`, and
+`self._max_retries` are not literal, and its key is conditional. The hypothesis
+therefore reports the call but refuses to run until those facts are made
+statically explicit.
 
 ## Reference payment scenario
 
@@ -167,7 +206,7 @@ The test suite is deterministic and does not require network access.
 - Mismatched attempt identifiers: not `confirmed`.
 - Malformed or contradictory evidence: `inconclusive`.
 
-`tests/test_ast_extractor.py` contains 30 labeled extraction cases covering:
+`tests/test_ast_extractor.py` contains 33 labeled extraction cases covering:
 
 - Supported calls, aliases, sessions, multiline calls, and source locations.
 - Literal, missing, dynamic, explicit-`None`, and tuple timeouts.
@@ -175,8 +214,19 @@ The test suite is deterministic and does not require network access.
 - Timeout/connection exception handlers and aliases.
 - Idempotency keys generated inside versus outside retry loops.
 - Missing or unknown headers and session-level header ambiguity.
+- Injected annotated sessions and conditional idempotency headers.
 - Unsupported tenacity, urllib3/HTTPAdapter, while-loop, and wrapper patterns.
 - JSON round-tripping, parse errors, and files without HTTP calls.
+
+`tests/test_hypothesis_integration.py` adds 6 end-to-end cases:
+
+- Buggy source -> hypothesis -> reference scenario -> `confirmed`.
+- Protected source with stable key -> hypothesis -> scenario ->
+  `not_reproduced`.
+- Reference client recognized as a call but not runnable.
+- Unknown retry bound blocks scenario construction.
+- Unsupported extraction blocks scenario construction.
+- Per-attempt idempotency key is not mapped onto the stable-key scenario.
 
 ## Known limitations
 
@@ -190,12 +240,21 @@ The test suite is deterministic and does not require network access.
 - **Narrow AST support.** The extractor handles only explicit requests patterns
   listed above. It does not perform data-flow analysis, trace wrappers across
   files, evaluate arbitrary expressions, follow decorators, or understand
-  third-party retry policies.
+  third-party retry policies. Injected sessions require an explicit
+  `requests.Session` annotation.
 - **Static assumptions.** Retry bounds are interpreted as one HTTP attempt per
   loop iteration; requests before the loop are not counted. Generated key
   stability is reported unknown unless a known fresh-value generator is
   evaluated inside the loop.
+- **Reference client is not runnable.** Its call is recognized through the
+  annotated injected session, but the endpoint, timeout, and retry limit are
+  instance attributes and the key is conditional. Those facts stay unknown or
+  ambiguous, so the hypothesis correctly refuses to configure a scenario.
+- **Hypothesis scope.** A runnable hypothesis requires exactly one recognized
+  call, a literal positive timeout, a known retry count, an identified
+  timeout/connection trigger, and a stable or absent idempotency key.
 - **Not a safety proof.** A `not_reproduced` verdict says this deterministic
   scenario did not produce the duplicate; it does not prove the guard is
   correct for every payload, key scope, or deployment topology.
-- **Not implemented yet:** LLM fallback, dashboard, and Alan integration.
+- **Not implemented yet:** LLM fallback, the second scenario, dashboard, and
+  Alan integration.
