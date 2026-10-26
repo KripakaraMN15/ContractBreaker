@@ -8,6 +8,10 @@ import requests
 
 from contractbreaker.events import EventKind, EventLog
 from contractbreaker.faults import FaultInjectionAdapter, FaultPlan
+from contractbreaker.hypothesis import (
+    ClientHypothesis,
+    recommend_scenario,
+)
 from contractbreaker.verifier import Report, verify_duplicate_side_effects
 
 from .client import PaymentClient, PaymentClientError
@@ -24,10 +28,13 @@ class PaymentScenarioConfig:
     client_sends_idempotency_key: bool
     max_retries: int = 1
     drop_response_on_attempts: frozenset[int] = frozenset({1})
+    request_timeout: float = 5.0
 
     def __post_init__(self) -> None:
         if self.max_retries < 0:
             raise ValueError("max_retries must not be negative")
+        if self.request_timeout <= 0:
+            raise ValueError("request_timeout must be positive")
         if not isinstance(self.drop_response_on_attempts, frozenset):
             object.__setattr__(
                 self,
@@ -60,6 +67,7 @@ def run_payment_scenario(config: PaymentScenarioConfig) -> Report:
         session,
         send_idempotency_key=config.client_sends_idempotency_key,
         max_retries=config.max_retries,
+        timeout=config.request_timeout,
     )
 
     try:
@@ -71,3 +79,25 @@ def run_payment_scenario(config: PaymentScenarioConfig) -> Report:
         session.close()
 
     return verify_duplicate_side_effects(log.events, side_effects=len(ledger))
+
+
+def config_from_hypothesis(
+    hypothesis: ClientHypothesis,
+    *,
+    server_supports_idempotency: bool,
+) -> PaymentScenarioConfig:
+    """Map runnable client facts onto the reference payment scenario.
+
+    Raises ``HypothesisNotRunnable`` when extraction is incomplete or
+    unsupported, so static evidence can never silently become a finding.
+    """
+
+    recommendation = recommend_scenario(hypothesis)
+    return PaymentScenarioConfig(
+        server_supports_idempotency=server_supports_idempotency,
+        client_sends_idempotency_key=(
+            recommendation.client_sends_idempotency_key
+        ),
+        max_retries=recommendation.max_retries,
+        request_timeout=recommendation.request_timeout,
+    )
