@@ -23,13 +23,17 @@ BUGGY_SOURCE = """import requests
 
 for attempt in range(2):
     try:
-        requests.post(
+        response = requests.post(
             "http://service.test/payments",
             json={"amount_cents": 1999},
             timeout=5,
         )
     except requests.exceptions.Timeout:
         continue
+    if response.status_code == 503:
+        continue
+    response.raise_for_status()
+    break
 """
 
 PROTECTED_SOURCE = """import uuid
@@ -38,13 +42,30 @@ import requests
 idempotency_key = str(uuid.uuid4())
 for attempt in range(2):
     try:
-        requests.post(
+        response = requests.post(
             "http://service.test/payments",
             headers={"Idempotency-Key": idempotency_key},
             timeout=5,
         )
     except requests.exceptions.Timeout:
         continue
+    if response.status_code == 503:
+        continue
+    response.raise_for_status()
+    break
+"""
+
+RETRY_500_ONLY_SOURCE = """import requests
+
+for attempt in range(2):
+    response = requests.post(
+        "http://service.test/payments",
+        timeout=5,
+    )
+    if response.status_code == 500:
+        continue
+    response.raise_for_status()
+    break
 """
 
 UNKNOWN_LIMIT_SOURCE = """import requests
@@ -108,6 +129,8 @@ def test_buggy_lost_response_cli_is_confirmed(tmp_path, capsys) -> None:
             "lost-response",
             "--format",
             "json",
+            "--execution-timeout",
+            "5",
         ],
         capsys,
     )
@@ -120,6 +143,14 @@ def test_buggy_lost_response_cli_is_confirmed(tmp_path, capsys) -> None:
     assert report["execution"]["occurred"] is True
     assert report["verdict_provenance"] == "runtime_verifier"
     assert report["scenario_configuration"]["settings"]["max_retries"] == 1
+    assert (
+        report["scenario_configuration"]["settings"]["execution_timeout_seconds"]
+        == 5.0
+    )
+    assert (
+        report["scenario_configuration"]["provenance"]["execution_timeout_seconds"]
+        == "cli"
+    )
 
 
 def test_protected_lost_response_cli_is_not_reproduced(tmp_path, capsys) -> None:
@@ -461,7 +492,7 @@ def test_retry_policy_can_be_explicitly_configured(tmp_path, capsys) -> None:
 def test_retry_policy_not_covering_server_error_is_not_confirmed(
     tmp_path, capsys
 ) -> None:
-    source = write_source(tmp_path, "buggy.py", BUGGY_SOURCE)
+    source = write_source(tmp_path, "retry_500_only.py", RETRY_500_ONLY_SOURCE)
 
     code, out, _ = run_cli(
         [
@@ -487,6 +518,23 @@ def test_retry_policy_not_covering_server_error_is_not_confirmed(
         "no-retry configuration" in limitation
         for limitation in report["limitations"]
     )
+
+
+def test_invalid_execution_timeout_exits_three(tmp_path) -> None:
+    source = write_source(tmp_path, "buggy.py", BUGGY_SOURCE)
+
+    code = main(
+        [
+            "analyze",
+            str(source),
+            "--scenario",
+            "lost-response",
+            "--execution-timeout",
+            "0",
+        ]
+    )
+
+    assert code == EXIT_INVALID_ARGS
 
 
 def test_missing_source_file_exits_four(tmp_path) -> None:
