@@ -20,11 +20,13 @@ from .benchmark import (
 from .pipeline import (
     SUPPORTED_SCENARIOS,
     SUPPORTED_SERVER_IDEMPOTENCY,
+    SUPPORTED_TIMEOUT_MODES,
     AnalysisOptions,
     AnalysisUsageError,
     SourceReadError,
     analyze,
 )
+from .timeout_contract import TIMEOUT_INVARIANTS
 from .report import (
     EXIT_INVALID_ARGS,
     EXIT_UNSUPPORTED_INPUT,
@@ -200,6 +202,24 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "maximum seconds for isolated analyzed-client execution "
             "(default: 10)"
+        ),
+    )
+    analyze_parser.add_argument(
+        "--timeout-mode",
+        choices=SUPPORTED_TIMEOUT_MODES,
+        default=None,
+        help=(
+            "ordering to simulate for the client-timeout scenario "
+            "(default: client_first_then_commit)"
+        ),
+    )
+    analyze_parser.add_argument(
+        "--timeout-invariant",
+        choices=tuple(TIMEOUT_INVARIANTS),
+        default=None,
+        help=(
+            "declared contract for the client-timeout scenario "
+            "(default: abort-on-timeout)"
         ),
     )
 
@@ -397,6 +417,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 server_error_status=args.server_error_status,
                 execution_timeout=args.execution_timeout,
+                timeout_mode=args.timeout_mode,
+                timeout_invariant=args.timeout_invariant,
                 llm_fallback=args.llm_fallback,
             )
         )

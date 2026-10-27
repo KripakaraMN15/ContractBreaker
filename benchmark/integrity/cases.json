@@ -1,0 +1,132 @@
+{
+  "suite": "evidence-integrity",
+  "dataset": "contractbreaker-integrity",
+  "dataset_version": "1.0",
+  "description": "Stored traces run through the production verifiers. Corrupt or contradictory evidence must never be confirmed; the positive control must still confirm.",
+  "cases": [
+    {
+      "id": "integrity-duplicate-side-effect-id",
+      "scenario": "lost-response",
+      "side_effects": 2,
+      "expected_verdict": "inconclusive",
+      "note": "Both commits reuse the same side_effect_id, so the ledger can not be trusted.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 4, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 5, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 6, "kind": "request_received", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 7, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 8, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 9, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    },
+    {
+      "id": "integrity-commit-for-unknown-attempt",
+      "scenario": "lost-response",
+      "side_effects": 2,
+      "expected_verdict": "inconclusive",
+      "note": "A commit attributed to an attempt that never sent a request.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "side_effect_committed", "attempt_id": "attempt-9", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 4, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 5, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 6, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-2"}},
+        {"seq": 7, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 8, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    },
+    {
+      "id": "integrity-drop-before-commit",
+      "scenario": "lost-response",
+      "side_effects": 2,
+      "expected_verdict": "inconclusive",
+      "note": "The response is recorded as dropped before the side effect it drops.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 4, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 5, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 6, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-2"}},
+        {"seq": 7, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 8, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    },
+    {
+      "id": "integrity-retry-decision-policy-mismatch",
+      "scenario": "retryable-error",
+      "side_effects": 2,
+      "expected_verdict": "inconclusive",
+      "note": "The recorded retry decision does not match the declared retry policy.",
+      "events": [
+        {"seq": 1, "kind": "retry_policy_configured", "attempt_id": null, "operation_id": null, "data": {"retry_statuses": [503], "max_retries": 1}},
+        {"seq": 2, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 3, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 4, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 5, "kind": "retryable_error_returned", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 503}},
+        {"seq": 6, "kind": "response_returned", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 503}},
+        {"seq": 7, "kind": "retry_scheduled", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 503, "retry_statuses": [500], "decision_provenance": "harness_configured"}},
+        {"seq": 8, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 9, "kind": "request_received", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 10, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-2"}},
+        {"seq": 11, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 12, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    },
+    {
+      "id": "integrity-timeout-without-harness-provenance",
+      "scenario": "client-timeout",
+      "side_effects": 1,
+      "invariant": "abort-on-timeout",
+      "expected_verdict": "inconclusive",
+      "note": "The timeout event claims the real requests timeout was enforced, which this harness can not verify.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "declared_timeout_seconds": 5.0, "declared_timeout_source": "derived_from_extraction", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "client_timeout_observed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"declared_timeout_seconds": 5.0, "declared_timeout_source": "derived_from_extraction", "enforced_by": "requests", "timeout_transport": "in_process_wsgi", "origin": "harness_timeout_fault", "real_requests_timeout_enforced": false, "timeout_mode": "client_first_then_commit"}},
+        {"seq": 4, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 5, "kind": "server_processing_completed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"outcome": "committed", "origin": "test_service"}},
+        {"seq": 6, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_gave_up"}}
+      ]
+    },
+    {
+      "id": "integrity-ledger-disagreement",
+      "scenario": "lost-response",
+      "side_effects": 1,
+      "expected_verdict": "inconclusive",
+      "note": "The observable ledger reports fewer effects than the trace records commits.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 4, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 5, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 6, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-2"}},
+        {"seq": 7, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 8, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    },
+    {
+      "id": "integrity-positive-control-confirmed",
+      "scenario": "lost-response",
+      "side_effects": 2,
+      "expected_verdict": "confirmed",
+      "note": "Positive control: a complete, consistent duplicate trace must still be confirmed.",
+      "events": [
+        {"seq": 1, "kind": "request_sent", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 2, "kind": "request_received", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 3, "kind": "side_effect_committed", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"side_effect_id": "effect-1"}},
+        {"seq": 4, "kind": "response_dropped", "attempt_id": "attempt-1", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 5, "kind": "request_sent", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"path": "/payments", "idempotency_key_present": false, "idempotency_key_fingerprint": null}},
+        {"seq": 6, "kind": "request_received", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"has_idempotency_key": false}},
+        {"seq": 7, "kind": "side_effect_committed", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"side_effect_id": "effect-2"}},
+        {"seq": 8, "kind": "response_returned", "attempt_id": "attempt-2", "operation_id": "op-1", "data": {"status_code": 201}},
+        {"seq": 9, "kind": "scenario_end", "attempt_id": null, "operation_id": null, "data": {"outcome": "client_completed"}}
+      ]
+    }
+  ]
+}

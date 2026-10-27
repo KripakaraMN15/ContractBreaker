@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .benchmark_integrity import integrity_cases_path, run_integrity_suite
 from .llm import LLMClient
-from .pipeline import AnalysisOptions, analyze
+from .pipeline import SUPPORTED_SCENARIOS, AnalysisOptions, analyze
 from .version import __version__
 
 BENCHMARK_SCHEMA_VERSION = "1.0"
@@ -16,7 +17,7 @@ EXIT_BENCHMARK_OK = 0
 EXIT_BENCHMARK_MISMATCH = 1
 EXIT_BENCHMARK_ERROR = 2
 
-SPLITS = ("development", "held_out")
+SPLITS = ("development", "held_out", "validation")
 _FACT_NAMES = (
     "method",
     "endpoint",
@@ -40,7 +41,10 @@ _INPUT_KEYS = {
     "retry_statuses",
     "server_error_status",
     "execution_timeout",
+    "timeout_mode",
+    "timeout_invariant",
 }
+_BENCHMARK_SCENARIOS = set(SUPPORTED_SCENARIOS) - {"auto"}
 
 
 class BenchmarkDatasetError(ValueError):
@@ -64,11 +68,12 @@ class BenchmarkCase:
 
 @dataclass(frozen=True)
 class BenchmarkDataset:
-    """A development and held-out dataset pair."""
+    """A labeled dataset pair plus the root its integrity suite lives under."""
 
     name: str
     version: str
     splits: dict[str, tuple[BenchmarkCase, ...]]
+    root: Path
 
 
 def load_benchmark_dataset(root: str | Path) -> BenchmarkDataset:
@@ -129,6 +134,7 @@ def load_benchmark_dataset(root: str | Path) -> BenchmarkDataset:
         name=dataset_name,
         version=dataset_version,
         splits=cases_by_split,
+        root=dataset_root,
     )
 
 
@@ -157,6 +163,10 @@ def run_benchmark_dataset(
         "deterministic_all_matched": deterministic_all_matched,
         "splits": split_reports,
     }
+    # Integrity is reported separately and never folded into ``all_matched``:
+    # the split result answers "do the labels match?" while the integrity suite
+    # answers "can corrupt evidence produce a confirmed verdict?".
+    report["integrity"] = _maybe_run_integrity(dataset.root)
     if not llm_fallback:
         return report
 
@@ -214,6 +224,7 @@ def _run_splits(
             "split": split,
             "case_count": len(results),
             "metrics": compute_metrics(results),
+            "cohorts": compute_cohorts(results),
             "cases": results,
         }
     return split_reports
@@ -350,6 +361,38 @@ def compute_metrics(case_results: list[dict[str, Any]]) -> dict[str, Any]:
     )
     case_errors = sum(1 for case in case_results if case.get("error"))
 
+    budgets = [
+        (case.get("actual") or {}).get("retry_budget") for case in case_results
+    ]
+    budget_outcomes = [
+        budget.get("outcome")
+        for budget in budgets
+        if isinstance(budget, dict)
+    ]
+
+    key_checks = [
+        (case.get("actual") or {}).get("idempotency_key")
+        for case in case_results
+    ]
+    key_outcomes = [
+        check.get("outcome") for check in key_checks if isinstance(check, dict)
+    ]
+
+    timeout_checks = [
+        (case.get("actual") or {}).get("timeout") for case in case_results
+    ]
+    timeout_outcomes = [
+        (check.get("observation") or {}).get("outcome")
+        for check in timeout_checks
+        if isinstance(check, dict)
+    ]
+    timeout_violations = sum(
+        1
+        for check in timeout_checks
+        if isinstance(check, dict)
+        and (check.get("invariant") or {}).get("violated") is True
+    )
+
     return {
         "case_count": total,
         "extraction": {
@@ -393,8 +436,146 @@ def compute_metrics(case_results: list[dict[str, Any]]) -> dict[str, Any]:
             "execution_failures": execution_failures,
             "unexpected_executions": unexpected_executions,
             "case_errors": case_errors,
+            "retry_budget": {
+                "evaluated_cases": len(budget_outcomes),
+                "within_budget_cases": budget_outcomes.count("within_budget"),
+                "budget_exceeded_cases": budget_outcomes.count(
+                    "budget_exceeded"
+                ),
+                "insufficient_evidence_cases": budget_outcomes.count(
+                    "insufficient_evidence"
+                ),
+                "not_evaluated_cases": sum(
+                    1 for budget in budgets if budget is None
+                ),
+            },
+            "idempotency_key": {
+                "evaluated_cases": len(key_outcomes),
+                "stable_cases": key_outcomes.count("stable"),
+                "changing_cases": key_outcomes.count("changing"),
+                "absent_cases": key_outcomes.count("absent"),
+                "insufficient_evidence_cases": key_outcomes.count(
+                    "insufficient_evidence"
+                ),
+                "not_evaluated_cases": sum(
+                    1 for check in key_checks if check is None
+                ),
+            },
+            "timeout": {
+                "evaluated_cases": len(timeout_outcomes),
+                "orphaned_commit_cases": timeout_outcomes.count(
+                    "orphaned_commit"
+                ),
+                "no_orphaned_commit_cases": timeout_outcomes.count(
+                    "no_orphaned_commit"
+                ),
+                "server_completed_first_cases": timeout_outcomes.count(
+                    "server_completed_first"
+                ),
+                "insufficient_evidence_cases": timeout_outcomes.count(
+                    "insufficient_evidence"
+                ),
+                "violated_invariant_cases": timeout_violations,
+                "not_evaluated_cases": sum(
+                    1 for check in timeout_checks if check is None
+                ),
+            },
         },
     }
+
+
+def compute_cohorts(case_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Partition one split into independent cohorts.
+
+    Each cohort keeps its own denominator so that a detection rate is never
+    averaged with a false-positive rate or a blocking rate. Cases are disjoint:
+    runnability first, then the expected verdict.
+    """
+
+    buggy = [
+        case
+        for case in case_results
+        if case["expected"]["runnable"]
+        and case["expected"]["verdict"] == "confirmed"
+    ]
+    fixed = [
+        case
+        for case in case_results
+        if case["expected"]["runnable"]
+        and case["expected"]["verdict"] == "not_reproduced"
+    ]
+    blocked = [case for case in case_results if not case["expected"]["runnable"]]
+    expected_inconclusive = [
+        case
+        for case in case_results
+        if case["expected"]["runnable"]
+        and case["expected"]["verdict"] == "inconclusive"
+    ]
+
+    def actual(case: dict[str, Any]) -> dict[str, Any]:
+        return case.get("actual") or {}
+
+    def execution_failures(members: list[dict[str, Any]]) -> int:
+        return sum(
+            1
+            for case in members
+            if case["expected"]["execution_expected"]
+            and not actual(case).get("executed", False)
+        )
+
+    detected = sum(1 for case in buggy if actual(case).get("verdict") == "confirmed")
+    missed = len(buggy) - detected
+    false_confirmed = sum(
+        1 for case in fixed if actual(case).get("verdict") == "confirmed"
+    )
+    correctly_blocked = sum(
+        1 for case in blocked if not actual(case).get("runnable")
+    )
+    incorrectly_allowed = len(blocked) - correctly_blocked
+    observed_inconclusive = sum(
+        1
+        for case in expected_inconclusive
+        if actual(case).get("verdict") == "inconclusive"
+    )
+
+    return {
+        "supported_buggy": {
+            "cases": len(buggy),
+            "detected": detected,
+            "missed": missed,
+            "detection_rate": _metric(detected, len(buggy)),
+            "missed_bug_rate": _metric(missed, len(buggy)),
+            "execution_failures": execution_failures(buggy),
+        },
+        "supported_fixed": {
+            "cases": len(fixed),
+            "false_confirmed": false_confirmed,
+            "false_positive_rate": _metric(false_confirmed, len(fixed)),
+            "execution_failures": execution_failures(fixed),
+        },
+        "unsupported_blocked": {
+            "cases": len(blocked),
+            "correctly_blocked": correctly_blocked,
+            "incorrectly_allowed": incorrectly_allowed,
+            "readiness_accuracy": _metric(correctly_blocked, len(blocked)),
+            "execution_failures": execution_failures(blocked),
+        },
+        "expected_inconclusive": {
+            "cases": len(expected_inconclusive),
+            "inconclusive": observed_inconclusive,
+            "unexpected_verdicts": len(expected_inconclusive)
+            - observed_inconclusive,
+            "execution_failures": execution_failures(expected_inconclusive),
+        },
+    }
+
+
+def _maybe_run_integrity(root: Path) -> dict[str, Any] | None:
+    """Run the optional evidence-integrity suite stored beside the splits."""
+
+    if not integrity_cases_path(root).is_file():
+        return None
+    return run_integrity_suite(root)
 
 
 def _llm_summary(llm_splits: dict[str, Any]) -> dict[str, Any]:
@@ -479,6 +660,9 @@ def benchmark_exit_code(report: dict[str, Any]) -> int:
     llm = report.get("llm_fallback")
     if llm is not None and llm.get("status") != "completed":
         return EXIT_BENCHMARK_ERROR
+    integrity = report.get("integrity")
+    if isinstance(integrity, dict) and not integrity.get("all_passed"):
+        return EXIT_BENCHMARK_MISMATCH
     return EXIT_BENCHMARK_OK if report.get("all_matched") else EXIT_BENCHMARK_MISMATCH
 
 
@@ -500,6 +684,25 @@ def render_benchmark_text(report: dict[str, Any]) -> str:
     ]
     for split in SPLITS:
         _render_split(lines, split, report["splits"][split])
+
+    integrity = report.get("integrity")
+    if isinstance(integrity, dict):
+        lines.append("")
+        lines.append(
+            f"Evidence integrity ({integrity['case_count']} cases, "
+            "reported separately from all_matched)"
+        )
+        lines.append(
+            f"  passed={integrity['passed']}, failed={integrity['failed']}, "
+            f"all_passed={'yes' if integrity['all_passed'] else 'no'}, "
+            f"false_confirmed={integrity['false_confirmed']}"
+        )
+        for case in integrity["cases"]:
+            status = "ok" if case["passed"] else "FAIL"
+            lines.append(
+                f"  [{status}] {case['id']}: expected "
+                f"{case['expected_verdict']}, got {case['actual_verdict']}"
+            )
 
     llm = report.get("llm_fallback")
     if llm is not None:
@@ -578,6 +781,36 @@ def _render_split(
     ]
     if inconclusive_ids:
         lines.append("  Inconclusive cases: " + ", ".join(inconclusive_ids))
+    cohorts = split_report.get("cohorts")
+    if isinstance(cohorts, dict):
+        buggy = cohorts["supported_buggy"]
+        fixed = cohorts["supported_fixed"]
+        blocked = cohorts["unsupported_blocked"]
+        expected_inconclusive = cohorts["expected_inconclusive"]
+        lines.append(
+            f"  Cohort supported_buggy ({buggy['cases']}): "
+            f"detected={buggy['detected']}, missed={buggy['missed']}, "
+            f"detection={_rate(buggy['detection_rate'])}, "
+            f"missed_rate={_rate(buggy['missed_bug_rate'])}"
+        )
+        lines.append(
+            f"  Cohort supported_fixed ({fixed['cases']}): "
+            f"false_confirmed={fixed['false_confirmed']}, "
+            f"false_positive_rate={_rate(fixed['false_positive_rate'])}"
+        )
+        lines.append(
+            f"  Cohort unsupported_blocked ({blocked['cases']}): "
+            f"correctly_blocked={blocked['correctly_blocked']}, "
+            f"incorrectly_allowed={blocked['incorrectly_allowed']}, "
+            f"readiness_accuracy={_rate(blocked['readiness_accuracy'])}"
+        )
+        lines.append(
+            f"  Cohort expected_inconclusive "
+            f"({expected_inconclusive['cases']}): "
+            f"inconclusive={expected_inconclusive['inconclusive']}, "
+            f"unexpected_verdicts="
+            f"{expected_inconclusive['unexpected_verdicts']}"
+        )
     unsupported_ids = [
         case["id"]
         for case in split_report["cases"]
@@ -603,7 +836,7 @@ def _load_case(
     case_id = _require_text(raw.get("id"), "case id")
     source = _require_text(raw.get("source"), f"{case_id} source")
     scenario = raw.get("scenario")
-    if scenario not in {"lost-response", "retryable-error"}:
+    if scenario not in _BENCHMARK_SCENARIOS:
         raise BenchmarkDatasetError(f"{case_id} has invalid scenario {scenario!r}")
     source_path = (split_dir / source).resolve()
     if not source_path.is_relative_to(split_dir.resolve()):
@@ -711,6 +944,8 @@ def _run_case(
                 ),
                 server_error_status=case.inputs.get("server_error_status"),
                 execution_timeout=case.inputs.get("execution_timeout"),
+                timeout_mode=case.inputs.get("timeout_mode"),
+                timeout_invariant=case.inputs.get("timeout_invariant"),
                 llm_fallback=llm_fallback,
                 llm_client=llm_client,
             )
@@ -792,6 +1027,13 @@ def _actual_from_report(
         "executed": report["execution"]["occurred"],
         "verdict": report["verdict"],
         "side_effects": report["execution"]["observed_side_effects"],
+        "retry_budget": report["execution"].get("retry_budget"),
+        "idempotency_key": report["execution"].get("idempotency_key"),
+        "server_deduplication": report["execution"].get(
+            "server_deduplication"
+        ),
+        "timeout": report["execution"].get("timeout"),
+        "failure": report["execution"].get("failure"),
     }
     if llm_mode:
         actual["llm_fallback"] = hypothesis.get("llm_fallback")

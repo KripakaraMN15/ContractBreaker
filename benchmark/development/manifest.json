@@ -244,12 +244,84 @@
           "idempotency_key_reused": {"status": "known", "value": false}
         },
         "warning_codes": [],
-        "runnable": false,
-        "execution_expected": false,
-        "verdict": "inconclusive",
-        "side_effects": null
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
       },
-      "notes": "Development pattern: fresh uuid key generated inside every attempt."
+      "notes": "Development pattern: fresh uuid key generated inside every attempt. Relabelled in milestone 10: the previous runnable=false label encoded an incorrect readiness rule that blocked exactly the behaviour the experiment exists to evaluate. With server deduplication inferred from the client's key presence, the changing key produces a second commit."
+    },
+    {
+      "id": "dev-key-stable-dedup-off",
+      "source": "dev_key_stable_dedup_off.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "off", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Milestone 10: a stable client key does not prove server enforcement. With deduplication explicitly off, the stable key still commits twice."
+    },
+    {
+      "id": "dev-key-stable-dedup-on",
+      "source": "dev_key_stable_dedup_on.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "on", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Milestone 10 fixed case: literal stable key with deduplication explicitly on. The retry is served from the idempotency record."
+    },
+    {
+      "id": "dev-key-changing-dedup-on",
+      "source": "dev_key_changing_dedup_on.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "on", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": false}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Milestone 10 buggy case: the client sends a key, but a fresh value per attempt. Explicit deduplication on does not help because the server never sees the same key twice."
     },
     {
       "id": "dev-conditional-key",
@@ -338,6 +410,122 @@
         "side_effects": 1
       },
       "notes": "Moved from held-out during label clarification: one-iteration loop catches the timeout, completes without retrying, and the verifier conservatively returns inconclusive. No detector change."
+    },
+    {
+      "id": "dev-timeout-orphan",
+      "source": "dev_timeout_client.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "off",
+        "timeout_mode": "client_first_then_commit",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 1
+      },
+      "notes": "Milestone 11 buggy case: the harness observes a client timeout, then resumes the suspended operation, which commits. Under the default abort-on-timeout invariant that late commit is a violation."
+    },
+    {
+      "id": "dev-timeout-orphan-allowed",
+      "source": "dev_timeout_client.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "off",
+        "timeout_mode": "client_first_then_commit",
+        "timeout_invariant": "allow-orphaned-commit",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Milestone 11 label test: the same runtime observation as dev-timeout-orphan, but the declared contract permits a late commit, so no violation is established. Proves the verdict follows the invariant, not the observation alone."
+    },
+    {
+      "id": "dev-timeout-no-commit",
+      "source": "dev_timeout_client.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "off",
+        "timeout_mode": "client_first_no_commit",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 0
+      },
+      "notes": "Milestone 11 fixed case: the server aborts when the client times out, so no side effect is committed after the timeout."
+    },
+    {
+      "id": "dev-timeout-server-first",
+      "source": "dev_timeout_client.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "off",
+        "timeout_mode": "server_first",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 5},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Milestone 11 control case: the server completes and the client receives the response, so no timeout is observed at all."
     }
   ]
 }

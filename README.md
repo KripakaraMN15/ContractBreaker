@@ -527,6 +527,105 @@ ready, blocked, executed (confirmed / not reproduced / inconclusive), and
 error. The causal timeline renders only events actually present in the
 returned trace; expected-but-missing events stay missing.
 
+## Using ContractBreaker with Alan
+
+ContractBreaker ships a repository-level Alan Skill at
+[`SKILL.md`](SKILL.md). The Skill teaches an Alan coding agent to drive the
+existing `contractbreaker workflow` CLI instead of reimplementing analysis,
+readiness, execution, or verification.
+
+The Skill is for investigating a narrow class of Python retry/timeout bugs that
+can duplicate a side effect. It is not a general repository scanner.
+
+### Opening the repository in Alan
+
+1. Open the repository in an Alan session using a supported execution target:
+   **This computer** (desktop app) or a **Remote** team VM or cloud sandbox
+   with the repository cloned into the selected folder.
+2. Confirm the CLI is installed in that environment:
+   `contractbreaker --version`. The documented install, if needed, is
+   `python -m pip install -e ".[dev]"` from the repository root.
+3. The agent discovers `SKILL.md` from the project folder, or you can invoke it
+   explicitly with `/contractbreaker` in the composer.
+
+No dashboard, API server, or MCP server is required for this path. Nothing is
+exposed to the network.
+
+### Sample request
+
+> Investigate duplicate payments after a lost response in
+> `path/to/client.py` using ContractBreaker. Plan it first and ask me before
+> executing.
+
+The agent should then run the equivalent of:
+
+```bash
+contractbreaker workflow \
+  --request "duplicate payment after a lost response" \
+  --source path/to/client.py \
+  --plan-only \
+  --format json
+```
+
+Note that the bundled `examples/payments/client.py` is deliberately a *partial*
+example: its HTTP call sits inside a method and its endpoint, timeout, and
+retry limit are not literals. Planning it therefore reports `blocked` with
+concrete blockers. That is the intended behavior, and a useful demonstration
+of the blocker path.
+
+### The workflow
+
+1. **Plan** — the agent runs `--plan-only` and reads
+   `analysis_snapshot.hypothesis.scenario_readiness` (`runnable`, `blockers`,
+   `unknowns`), the extracted facts with `fact_provenance`, and the extraction
+   warnings. No analyzed code runs.
+2. **Explain** — the agent shows the selected scenario, the facts, the
+   blockers, what would execute, and what evidence would be collected.
+3. **Explicit approval** — the agent stops and asks for approval of that
+   specific plan. General enthusiasm, an earlier unrelated approval, or a
+   request to *create* the plan is not approval to execute.
+4. **Execute** — only after approval, and only if the plan is runnable, the
+   agent runs `--approve` and reads `analysis.verdict`,
+   `analysis.verdict_reason`, and
+   `analysis.execution.observed_side_effects`.
+5. **Report** — the agent separates static extraction facts from runtime
+   observations, quotes the verifier verdict and side-effect count unchanged,
+   and includes the trace IDs, blockers, and limitations.
+
+The quote below is the actual shape of a completed run (abridged):
+
+```text
+verdict: confirmed
+verdict_provenance: runtime_verifier
+observed_side_effects: 2
+```
+
+### Limitations of this integration
+
+- **Conversational approval is an instruction-level gate, not a security
+  boundary.** It depends on the agent following `SKILL.md`. The dashboard's
+  server-issued approval token is the stronger boundary; use it for untrusted
+  input.
+- The runtime contract is narrow: one module-level `requests` call site,
+  `POST /payments`, allowlisted imports, and a stable or absent idempotency
+  key. Unsupported clients are reported as blocked, not worked around.
+- Subprocess execution is deterministic test isolation, not a hardened
+  security sandbox.
+- **End-to-end Alan integration has not been verified in a real session.** The
+  Skill and the commands in this section are based on the repository's verified
+  CLI behavior, but the Alan-side experience is provisional until a real
+  session succeeds.
+
+### Model and demo policy
+
+- Keep `--llm-fallback` **disabled** for the judged demo. It is off by default.
+- The fallback's default model is a proprietary one. The hackathon rules say
+  "Alan + open models"; do not enable proprietary model calls unless the
+  organizers confirm they are permitted.
+- Never put `OPENAI_API_KEY` or any other secret in a report, a prompt, or a
+  committed file. Do not upload or clone a repository into a cloud environment
+  without the user's awareness and authorization.
+
 ## LLM extraction fallback (milestone 6B)
 
 The optional fallback helps interpret unresolved retry, timeout, and
@@ -665,6 +764,42 @@ unique side effect. A retry request without a recorded policy decision is
 The fixed variant enables server idempotency and sends a stable key. The retry
 receives an `idempotent_replay` and only one side effect exists, producing
 `not_reproduced`.
+
+## Client-timeout scenario (milestone 11)
+
+`--scenario client-timeout` asks a different question: after the client gives up
+at a deadline, does the server still commit? It models **one** attempt and does
+not require a retry loop, a retry budget, or a reusable idempotency key.
+
+The harness suspends the request inside the payment service instead of delaying
+it, so the ordering of the timeout and any later commit is fixed by
+configuration rather than by a clock. Three modes are available:
+
+| `--timeout-mode` | Server behaviour | Client sees |
+| --- | --- | --- |
+| `server_first` | commits and returns | 201 response |
+| `client_first_then_commit` *(default)* | suspended, committed after the timeout | simulated timeout |
+| `client_first_no_commit` | suspended, aborted after the timeout | simulated timeout |
+
+**The timeout is simulated.** `client_timeout_observed` is generated by the
+harness in the in-process WSGI simulation; `requests`' own `timeout` argument is
+never enforced by this transport. Every report for this scenario states
+`execution.timeout.simulation.real_requests_timeout_enforced: false` and carries
+a limitation saying so. Harness execution timeouts are separate: they appear as
+`execution.failure.kind = "harness_timeout"` with `execution.timeout = null`.
+
+An observed late commit is reported as `observation.outcome:
+"orphaned_commit"`. Whether that is a **bug** depends on the declared contract:
+
+| `--timeout-invariant` | Meaning |
+| --- | --- |
+| `abort-on-timeout` *(default)* | a side effect must not be committed after the client observed a timeout |
+| `allow-orphaned-commit` | the server may finish after the client gives up; the late commit is permitted |
+
+`confirmed` is produced only when the declared invariant is violated. The same
+trace yields `confirmed` under `abort-on-timeout` and `not_reproduced` under
+`allow-orphaned-commit`. The report names the invariant, its source
+(`cli` or `scenario_default`), and `violated`.
 
 ## Setup
 
@@ -970,17 +1105,50 @@ counted as successful LLM-assisted evaluation.
 
 ### Current synthetic results
 
-All 13 development and 10 held-out labeled cases matched their expected
-labels.
+All 20 development, 10 held-out, and 12 independent-validation labeled cases
+matched their expected labels, and all 7 evidence-integrity cases produced the
+expected verdict.
 
 | Split | Cases | Status | Facts | Warnings | Uncertainty | Runnable/blocked | Incorrectly allowed | Detection | False positives | Side effects | Inconclusive |
 | --- | ---: | --- | --- | --- | --- | --- | ---: | --- | --- | --- | ---: |
-| Development | 13 | 13/13 | 12/12 each | 13/13 | 8/8 | 7/6 | 0 | 2/2 | 0/4 | 7/7 | 7 |
-| Held-out | 10 | 10/10 | 9/9 each | 10/10 | 4/4 | 4/6 | 0 | 1/1 | 0/3 | 4/4 | 6 |
+| Development | 20 | 20/20 | all labeled | 20/20 | 8/8 | 15/5 | 0 | 6/6 | 0/8 | 15/15 | 6 |
+| Held-out | 10 | 10/10 | all labeled | 10/10 | 4/4 | 4/6 | 0 | 1/1 | 0/3 | 4/4 | 6 |
+| Independent validation | 12 | 12/12 | all labeled | 12/12 | 13/13 | 9/3 | 0 | 4/4 | 0/5 | 9/9 | 3 |
 
 Held-out inconclusive cases: `held-lost-while-buggy`,
 `held-lost-retry-wrapper`, `held-retry-fresh-key`, `held-timeout-zero`,
 `held-unsupported-tenacity`, `held-parse-error`.
+
+### Independent validation and evidence integrity (milestone 12)
+
+The benchmark reports three splits plus a separate integrity suite; it no
+longer emits a single aggregate:
+
+- `development` and `held_out` are the original synthetic regression fixtures.
+- `validation` holds 12 independently authored compatibility fixtures. They are
+  **not public real-world client code**, and passing them does **not**
+  demonstrate generalisation to public clients. They were written for this
+  repository with different control flow, binding style, and constants from the
+  development fixtures, including matched buggy/fixed pairs that differ only in
+  the reliability behaviour under test.
+- `integrity` stores 7 event traces that are replayed through the **production
+  verifiers**. Corrupt or contradictory traces must stay `inconclusive`, and the
+  suite includes a positive control that must still be `confirmed`.
+
+Per split, cases are partitioned into four cohorts, each with its own
+denominator: `supported_buggy` (detection, missed-bug rate), `supported_fixed`
+(false-positive rate), `unsupported_blocked` (readiness accuracy), and
+`expected_inconclusive` (unexpected verdicts). No combined accuracy number is
+reported.
+
+`integrity.all_passed` and `integrity.false_confirmed` are reported separately
+from `all_matched`, which covers only the three splits. The CLI exits non-zero
+if either the splits or the integrity suite fails.
+
+Two held-out fixtures were replaced in this milestone because their files were
+byte-identical to development fixtures (`held_lost_retry_wrapper.py` and
+`held_retry_policy_disagree.py`). Their expected verdicts, readiness, and side
+effect counts are unchanged; only the source text is now independent.
 
 An offline fake-provider LLM-assisted pass was also run through the same
 benchmark to validate the comparison path. The fake provider is **not a live
@@ -1100,3 +1268,50 @@ or generalization beyond this synthetic dataset.
   lives in server memory only and is lost when the server restarts.
 - **Not implemented yet:** Alan integration; no multi-agent or autonomous LLM
   extraction framework is present.
+- **Idempotency-key stability is observed at runtime.** `execution.idempotency_key`
+  reports `stable`, `changing`, `absent`, or `insufficient_evidence` from the key
+  recorded on each attempt, alongside - never instead of - the AST expectation,
+  which keeps its own provenance. Keys are compared as truncated SHA-256
+  fingerprints; raw header values are never written to the report. A single
+  keyed attempt cannot establish stability and is reported as insufficient
+  evidence.
+- **Server deduplication is reported separately from client key behaviour.**
+  `execution.server_deduplication` records the configured server behaviour, its
+  provenance, and the number of replays actually observed. `--server-idempotency
+  auto` is reported as `inferred_from_client_facts` with `inferred: true`: a
+  `not_reproduced` verdict that depends on it is conditional. Use `on` or `off`
+  for independent evidence. A stable client key does not prove the server
+  enforces deduplication, and a deduplicating server does not prove the client
+  reuses its key.
+- **Unstable keys are testable.** A client whose key is known to change between
+  attempts is now runnable, because that is the behaviour the experiment
+  evaluates. Execution is still blocked when key presence or reuse is
+  unresolved, or when the runtime contract is unsupported.
+- **Client timeouts are simulated, not enforced.** The in-process WSGI transport
+  never honours a client's `requests` timeout. Only `--scenario client-timeout`
+  evaluates timeout behaviour, and it injects the timeout itself at a fixed
+  ordering point. The report always records
+  `real_requests_timeout_enforced: false`.
+- **A timeout is not automatically a bug.** The client-timeout scenario compares
+  the observed sequence against a declared invariant. An `orphaned_commit` is
+  `confirmed` only under an invariant that forbids it; under
+  `allow-orphaned-commit` the same observation is `not_reproduced`.
+- **Harness execution timeouts are not client timeouts.** A worker killed by
+  `--execution-timeout` produces `execution.failure.kind = "harness_timeout"`
+  with no timeout evidence; it is never reported as a simulated client timeout.
+- **The validation split is independently authored, not real-world.** Its 12
+  fixtures are compatibility cases written for this repository. No public client
+  has been validated, and passing this split does not show that ContractBreaker
+  generalises to public client code.
+- **No public client currently fits the runtime contract.** Every public SDK
+  client examined conceptually violates at least two rules (module-level call,
+  `POST /payments`, literal timeout). They are blocked rather than modified or
+  forced through the harness; no such code was downloaded or executed.
+- **Evidence integrity is scored separately.** The 7 stored traces are replayed
+  through the production verifiers. This is regression evidence for the
+  verifiers, not a fuzzing campaign, and it does not cover every malformed trace
+  shape.
+- **Benchmark categories are not a single score.** Detection, missed bugs,
+  false positives, readiness errors, inconclusive outcomes, and execution
+  failures keep separate denominators; the dataset remains small (42 split
+  cases plus 7 integrity traces).

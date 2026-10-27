@@ -31,8 +31,10 @@ _BASE_LIMITATIONS = (
     "the network layer.",
     "Static extraction and runtime execution support only the documented "
     "module-level requests client patterns.",
-    "Static retry and timeout values are recorded as expectations; the analyzed "
-    "client's own code controls actual attempts and request timeouts.",
+    "Static retry and timeout values are recorded as expectations. The "
+    "in-process transport does not enforce a client's requests timeout, so "
+    "timeout behaviour is only evaluated by the dedicated client-timeout "
+    "scenario, which injects the timeout itself.",
 )
 
 
@@ -55,6 +57,10 @@ class ScenarioExecution:
     settings: dict[str, Any]
     provenance: dict[str, str]
     report: Report
+    retry_budget: dict[str, Any] | None = None
+    idempotency_key: dict[str, Any] | None = None
+    server_deduplication: dict[str, Any] | None = None
+    timeout: dict[str, Any] | None = None
 
 
 def build_analysis_snapshot(
@@ -115,6 +121,7 @@ def build_report(
     limitations: Iterable[str] = (),
     llm_fallback: dict[str, Any] | None = None,
     fact_provenance: dict[str, str] | None = None,
+    execution_failure: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable JSON-native report dictionary."""
 
@@ -154,6 +161,11 @@ def build_report(
             "operation_ids": [],
             "side_effect_ids": [],
             "observed_side_effects": None,
+            "retry_budget": None,
+            "idempotency_key": None,
+            "server_deduplication": None,
+            "timeout": None,
+            "failure": execution_failure,
         }
         verdict = Verdict.INCONCLUSIVE.value
         verdict_reason = reason
@@ -190,6 +202,11 @@ def build_report(
                 and _has_text(event["data"].get("side_effect_id"))
             ],
             "observed_side_effects": execution.report.side_effects,
+            "retry_budget": execution.retry_budget,
+            "idempotency_key": execution.idempotency_key,
+            "server_deduplication": execution.server_deduplication,
+            "timeout": execution.timeout,
+            "failure": execution_failure,
         }
         verdict = execution.report.verdict.value
         verdict_reason = execution.report.reason
@@ -382,6 +399,12 @@ def render_text(report: dict[str, Any]) -> str:
     lines.append("Runtime evidence")
     if not execution["occurred"]:
         lines.append("  none; no runtime scenario was executed")
+        failure = execution.get("failure")
+        if isinstance(failure, dict):
+            lines.append(
+                f"  harness failure: {failure.get('kind')} "
+                f"({failure.get('message')})"
+            )
     else:
         for event in execution["events"]:
             details = []
@@ -403,6 +426,50 @@ def render_text(report: dict[str, Any]) -> str:
         lines.append(
             f"  observed side effects: {execution['observed_side_effects']}"
         )
+        budget = execution.get("retry_budget")
+        if isinstance(budget, dict):
+            lines.append(
+                "  retry budget: "
+                f"{budget.get('outcome')} "
+                f"(observed {budget.get('observed_attempts')} of "
+                f"{budget.get('expected_max_attempts')} permitted attempt(s))"
+            )
+            lines.append(f"    reason: {budget.get('reason')}")
+        keys = execution.get("idempotency_key")
+        if isinstance(keys, dict):
+            lines.append(
+                "  idempotency key: "
+                f"{keys.get('outcome')} "
+                f"({keys.get('distinct_key_count')} distinct value(s) across "
+                f"{len(keys.get('attempts') or [])} attempt(s))"
+            )
+            lines.append(f"    reason: {keys.get('reason')}")
+        dedup = execution.get("server_deduplication")
+        if isinstance(dedup, dict):
+            lines.append(
+                "  server deduplication: "
+                f"{'on' if dedup.get('enabled') else 'off'} "
+                f"[{dedup.get('provenance')}"
+                f"{', inferred' if dedup.get('inferred') else ''}], "
+                f"observed replays: {dedup.get('observed_replay_count')}"
+            )
+        timeout = execution.get("timeout")
+        if isinstance(timeout, dict):
+            observation = timeout.get("observation") or {}
+            invariant = timeout.get("invariant") or {}
+            simulation = timeout.get("simulation") or {}
+            lines.append(
+                f"  client timeout: {observation.get('outcome')} "
+                f"(invariant {invariant.get('id')}: "
+                f"{'violated' if invariant.get('violated') else 'not violated'})"
+            )
+            lines.append(
+                "    simulated: "
+                f"enforced_by={simulation.get('timeout_enforced_by')}, "
+                "real_requests_timeout_enforced="
+                f"{simulation.get('real_requests_timeout_enforced')}"
+            )
+            lines.append(f"    reason: {observation.get('reason')}")
     lines.append("")
 
     lines.append(f"Verdict: {str(report['verdict']).upper()}")

@@ -23,7 +23,7 @@ import requests
 from examples.payments.retryable_error_service import (
     create_retryable_error_payment_app,
 )
-from examples.payments.service import create_payment_app
+from examples.payments.service import TimeoutPaymentService, create_payment_app
 
 from .events import EventKind, EventLog
 from .faults import FaultInjectionAdapter, FaultPlan
@@ -32,7 +32,13 @@ _ORIGINAL_SESSION = requests.Session
 
 
 class RuntimeEventLog(EventLog):
-    """Event log that converts a retryable response into an observed decision."""
+    """Event log that converts a retryable response into an observed decision.
+
+    A ``retry_scheduled`` event produced here is derived from the harness's own
+    configured status policy plus the arrival of a later request for the same
+    operation. It is explicitly stamped ``harness_configured`` because it is not
+    an observation of what the analyzed client decided.
+    """
 
     def __init__(self, retry_statuses: frozenset[int]) -> None:
         super().__init__()
@@ -59,6 +65,8 @@ class RuntimeEventLog(EventLog):
                 operation_id=operation_id,
                 status_code=status_code,
                 retry_statuses=tuple(sorted(self._retry_statuses)),
+                decision_provenance="harness_configured",
+                decision_source="harness_request_sequence",
             )
         event = super().record(
             kind,
@@ -153,10 +161,24 @@ def _write_result(
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _expected_max_attempts(args: argparse.Namespace) -> tuple[int, str]:
+    """Return the declared attempt budget and where it came from.
+
+    A statically extracted loop bound (``max_attempts``) is preferred. Falling
+    back to ``max_retries + 1`` encodes the documented assumption that each
+    loop iteration performs exactly one HTTP attempt.
+    """
+
+    if args.policy_max_attempts is not None:
+        return args.policy_max_attempts, "extraction"
+    return args.policy_max_retries + 1, "derived_from_retry_count"
+
+
 def _run(args: argparse.Namespace) -> None:
     retry_statuses = frozenset(args.retry_statuses)
     log = RuntimeEventLog(retry_statuses)
     ledger: list[dict[str, object]] = []
+    service: TimeoutPaymentService | None = None
 
     if args.scenario == "retryable-error":
         log.record(
@@ -166,12 +188,40 @@ def _run(args: argparse.Namespace) -> None:
         )
 
     if args.scenario == "lost-response":
+        expected_attempts, attempts_source = _expected_max_attempts(args)
+        log.record(
+            EventKind.RETRY_POLICY_CONFIGURED,
+            retry_statuses=(),
+            max_retries=args.policy_max_retries,
+            max_attempts=expected_attempts,
+            max_attempts_source=attempts_source,
+        )
+
+    if args.scenario == "lost-response":
         app = create_payment_app(
             ledger,
             log,
             supports_idempotency=args.server_idempotency,
         )
         plan = FaultPlan(drop_response_on_attempts=frozenset({1}))
+    elif args.scenario == "client-timeout":
+        timeout_mode = args.timeout_mode or "server_first"
+        service = TimeoutPaymentService(
+            ledger,
+            log,
+            supports_idempotency=args.server_idempotency,
+            suspend=timeout_mode in {
+                "client_first_then_commit",
+                "client_first_no_commit",
+            },
+        )
+        app = service.app
+        plan = FaultPlan(
+            drop_response_on_attempts=frozenset(),
+            timeout_mode=timeout_mode,
+            declared_timeout_seconds=args.declared_timeout,
+            declared_timeout_source=args.declared_timeout_source,
+        )
     else:
         app = create_retryable_error_payment_app(
             ledger,
@@ -190,6 +240,7 @@ def _run(args: argparse.Namespace) -> None:
     _patch_requests(adapter)
     _block_network()
 
+    failure: BaseException | None = None
     try:
         with open(os.devnull, "w", encoding="utf-8") as devnull:
             with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(
@@ -197,11 +248,23 @@ def _run(args: argparse.Namespace) -> None:
             ):
                 runpy.run_path(args.source, run_name="__main__")
     except BaseException as exc:
+        failure = exc
+
+    # The suspended operation finishes only after the client has observed the
+    # timeout, so the resulting commit is provably later than the client's
+    # observation. Completion is recorded before scenario_end so the trace
+    # keeps a single terminal event.
+    if service is not None:
+        service.complete(
+            commit=args.timeout_mode == "client_first_then_commit"
+        )
+
+    if failure is not None:
         log.record(
             EventKind.SCENARIO_END,
             outcome="client_gave_up",
-            error_type=type(exc).__name__,
-            error_message=str(exc)[:500],
+            error_type=type(failure).__name__,
+            error_message=str(failure)[:500],
         )
     else:
         log.record(EventKind.SCENARIO_END, outcome="client_completed")
@@ -220,7 +283,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scenario",
         required=True,
-        choices=("lost-response", "retryable-error"),
+        choices=("lost-response", "retryable-error", "client-timeout"),
     )
     parser.add_argument("--server-idempotency", action="store_true")
     parser.add_argument(
@@ -232,6 +295,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--server-error-status", type=int, default=503)
     parser.add_argument("--policy-max-retries", type=int, default=1)
+    parser.add_argument(
+        "--policy-max-attempts",
+        type=int,
+        default=None,
+        help="statically extracted attempt budget for the lost-response scenario",
+    )
+    parser.add_argument(
+        "--timeout-mode",
+        default=None,
+        choices=(
+            "server_first",
+            "client_first_then_commit",
+            "client_first_no_commit",
+        ),
+        help="ordering to simulate for the client-timeout scenario",
+    )
+    parser.add_argument(
+        "--declared-timeout",
+        type=float,
+        default=None,
+        help="declared client timeout recorded as context, never enforced",
+    )
+    parser.add_argument(
+        "--declared-timeout-source",
+        default=None,
+        help="where the declared timeout value came from",
+    )
     return parser
 
 

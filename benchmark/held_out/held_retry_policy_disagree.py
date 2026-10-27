@@ -6,7 +6,7 @@ for attempt in range(2):
         json={"amount_cents": 1999},
         timeout=5,
     )
-    if response.status_code == 500:
+    if response.status_code in (408, 429):
         continue
     response.raise_for_status()
     break

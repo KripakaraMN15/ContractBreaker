@@ -13,10 +13,12 @@ from contractbreaker.benchmark import (
     EXIT_BENCHMARK_OK,
     BenchmarkDatasetError,
     benchmark_exit_code,
+    compute_cohorts,
     compute_metrics,
     load_benchmark_dataset,
     run_benchmark,
 )
+from contractbreaker.benchmark_integrity import run_integrity_suite
 from contractbreaker.cli import main
 from contractbreaker.llm import (
     LLMResponse,
@@ -130,10 +132,12 @@ def write_dataset(
     held_out_cases: list[dict],
     *,
     dataset_version: str = "1.0",
+    validation_cases: list[dict] | None = None,
 ) -> None:
     for split, cases in (
         ("development", development_cases),
         ("held_out", held_out_cases),
+        ("validation", validation_cases or []),
     ):
         split_dir = root / split
         split_dir.mkdir(parents=True, exist_ok=True)
@@ -330,6 +334,157 @@ def test_known_metric_calculations() -> None:
     assert metrics["runtime"]["unexpected_executions"] == 1
 
 
+def test_retry_budget_metrics_are_read_from_runtime_evidence() -> None:
+    def budget(outcome: str, observed: int) -> dict:
+        return {
+            "outcome": outcome,
+            "expected_max_attempts": 2,
+            "observed_attempts": observed,
+            "provenance": {
+                "outcome": "runtime_check",
+                "expected_max_attempts": "derived_from_extraction",
+                "observed_attempts": "runtime_observation",
+            },
+            "reason": "test",
+        }
+
+    base_expected = {
+        "extraction_status": "supported",
+        "facts": {},
+        "warning_codes": [],
+        "runnable": True,
+        "execution_expected": True,
+        "verdict": "confirmed",
+        "side_effects": 2,
+    }
+    cases = [
+        # Label says confirmed, runtime budget says exceeded: the metric must
+        # follow the runtime observation, never the label.
+        metric_case(
+            expected=base_expected,
+            actual={
+                "runnable": True,
+                "executed": True,
+                "verdict": "confirmed",
+                "side_effects": 2,
+                "retry_budget": budget("budget_exceeded", 3),
+            },
+            checks=checks_for(),
+        ),
+        # Deliberately mislabeled case: expected says confirmed, runtime is not.
+        metric_case(
+            expected=base_expected,
+            actual={
+                "runnable": True,
+                "executed": True,
+                "verdict": "not_reproduced",
+                "side_effects": 1,
+                "retry_budget": budget("within_budget", 2),
+            },
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected={**base_expected, "runnable": False, "execution_expected": False},
+            actual={
+                "runnable": False,
+                "executed": False,
+                "verdict": "inconclusive",
+                "side_effects": None,
+                "retry_budget": None,
+            },
+            checks=checks_for(),
+        ),
+    ]
+
+    metrics = compute_metrics(cases)
+
+    assert metrics["runtime"]["retry_budget"] == {
+        "evaluated_cases": 2,
+        "within_budget_cases": 1,
+        "budget_exceeded_cases": 1,
+        "insufficient_evidence_cases": 0,
+        "not_evaluated_cases": 1,
+    }
+
+
+def test_timeout_metrics_separate_observation_from_violation() -> None:
+    def timeout_block(outcome: str, violated: bool) -> dict:
+        return {
+            "observation": {"outcome": outcome},
+            "invariant": {"id": "abort-on-timeout", "violated": violated},
+        }
+
+    base_expected = {
+        "extraction_status": "supported",
+        "facts": {},
+        "warning_codes": [],
+        "runnable": True,
+        "execution_expected": True,
+        "verdict": "confirmed",
+        "side_effects": 1,
+    }
+    cases = [
+        metric_case(
+            expected=base_expected,
+            actual={
+                "runnable": True,
+                "executed": True,
+                "verdict": "confirmed",
+                "side_effects": 1,
+                "timeout": timeout_block("orphaned_commit", True),
+            },
+            checks=checks_for(),
+        ),
+        # Same observation, permitted by the declared contract: the label says
+        # not_reproduced and the metric must still record the observation.
+        metric_case(
+            expected={**base_expected, "verdict": "not_reproduced"},
+            actual={
+                "runnable": True,
+                "executed": True,
+                "verdict": "not_reproduced",
+                "side_effects": 1,
+                "timeout": timeout_block("orphaned_commit", False),
+            },
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected=base_expected,
+            actual={
+                "runnable": True,
+                "executed": True,
+                "verdict": "not_reproduced",
+                "side_effects": 0,
+                "timeout": timeout_block("no_orphaned_commit", False),
+            },
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected={**base_expected, "runnable": False, "execution_expected": False},
+            actual={
+                "runnable": False,
+                "executed": False,
+                "verdict": "inconclusive",
+                "side_effects": None,
+                "timeout": None,
+            },
+            checks=checks_for(),
+        ),
+    ]
+
+    metrics = compute_metrics(cases)
+
+    assert metrics["runtime"]["timeout"] == {
+        "evaluated_cases": 3,
+        "orphaned_commit_cases": 2,
+        "no_orphaned_commit_cases": 1,
+        "server_completed_first_cases": 0,
+        "insufficient_evidence_cases": 0,
+        "violated_invariant_cases": 1,
+        "not_evaluated_cases": 1,
+    }
+
+
 def test_labels_do_not_change_runtime_verdict(tmp_path) -> None:
     source = write_case(
         tmp_path,
@@ -402,7 +557,7 @@ def test_benchmark_cli_json_and_unsupported_case_not_executed(
 
     assert code == EXIT_BENCHMARK_OK
     report = json.loads(captured.out)
-    assert set(report["splits"]) == {"development", "held_out"}
+    assert set(report["splits"]) == {"development", "held_out", "validation"}
     assert report["splits"]["development"]["cases"][0]["actual"]["executed"] is True
     assert report["splits"]["held_out"]["cases"][0]["actual"]["executed"] is False
     assert report["splits"]["held_out"]["cases"][0]["actual"]["verdict"] == "inconclusive"
@@ -712,3 +867,159 @@ def test_dataset_loader_rejects_source_outside_split(tmp_path) -> None:
 
     with pytest.raises(BenchmarkDatasetError, match="escapes"):
         load_benchmark_dataset(tmp_path)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+TIMEOUT_SOURCE = """import requests
+
+response = requests.post(
+    "http://service.test/payments",
+    json={"amount_cents": 4200},
+    timeout=4,
+)
+"""
+
+
+def test_cohorts_partition_every_case_exactly_once() -> None:
+    cases = [
+        metric_case(
+            expected=supported_buggy_expected(),
+            actual={"runnable": True, "executed": True, "verdict": "confirmed", "side_effects": 2},
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected={**supported_buggy_expected(), "verdict": "not_reproduced", "side_effects": 1},
+            actual={"runnable": True, "executed": True, "verdict": "not_reproduced", "side_effects": 1},
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected={**supported_buggy_expected(), "runnable": False, "execution_expected": False},
+            actual={"runnable": False, "executed": False, "verdict": "inconclusive", "side_effects": None},
+            checks=checks_for(),
+        ),
+        metric_case(
+            expected={**supported_buggy_expected(), "verdict": "inconclusive", "side_effects": 1},
+            actual={"runnable": True, "executed": True, "verdict": "inconclusive", "side_effects": 1},
+            checks=checks_for(),
+        ),
+    ]
+
+    cohorts = compute_cohorts(cases)
+
+    assert sum(cohort["cases"] for cohort in cohorts.values()) == len(cases)
+    assert cohorts["supported_buggy"]["cases"] == 1
+    assert cohorts["supported_fixed"]["cases"] == 1
+    assert cohorts["unsupported_blocked"]["cases"] == 1
+    assert cohorts["expected_inconclusive"]["cases"] == 1
+    assert cohorts["supported_buggy"]["missed_bug_rate"] == {
+        "correct": 0,
+        "total": 1,
+        "rate": 0.0,
+    }
+
+
+def test_integrity_suite_passes_on_the_repository_dataset() -> None:
+    result = run_integrity_suite(REPO_ROOT / "benchmark")
+
+    assert result["case_count"] == 7
+    assert result["passed"] == 7
+    assert result["failed"] == 0
+    assert result["all_passed"] is True
+    assert result["false_confirmed"] == 0
+    control = next(
+        case
+        for case in result["cases"]
+        if case["id"] == "integrity-positive-control-confirmed"
+    )
+    assert control["actual_verdict"] == "confirmed"
+    assert control["passed"] is True
+
+
+def test_integrity_suite_detects_a_wrongly_confirmed_corrupt_trace(
+    tmp_path,
+) -> None:
+    source = json.loads(
+        (REPO_ROOT / "benchmark" / "integrity" / "cases.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    control = next(
+        case
+        for case in source["cases"]
+        if case["id"] == "integrity-positive-control-confirmed"
+    )
+    # Relabel the positive control as a corrupt trace that must stay
+    # inconclusive. If the verifier still confirms it, the suite must fail.
+    control["expected_verdict"] = "inconclusive"
+    control["id"] = "tampered-should-not-confirm"
+    integrity_dir = tmp_path / "integrity"
+    integrity_dir.mkdir()
+    (integrity_dir / "cases.json").write_text(
+        json.dumps({"cases": [control]}), encoding="utf-8"
+    )
+
+    result = run_integrity_suite(tmp_path)
+
+    assert result["all_passed"] is False
+    assert result["failed"] == 1
+    assert result["false_confirmed"] == 1
+
+
+def test_benchmark_exit_code_fails_when_integrity_fails() -> None:
+    report = {
+        "all_matched": True,
+        "llm_fallback": None,
+        "integrity": {"all_passed": False},
+    }
+
+    assert benchmark_exit_code(report) == EXIT_BENCHMARK_MISMATCH
+
+
+def test_validation_split_is_independently_authored() -> None:
+    dataset = load_benchmark_dataset(REPO_ROOT / "benchmark")
+    validation = dataset.splits["validation"]
+
+    assert len(validation) == 12
+    assert all(case.case_id.startswith("val-") for case in validation)
+    assert all(case.split == "validation" for case in validation)
+    runnable = [case for case in validation if case.expected["runnable"]]
+    blocked = [case for case in validation if not case.expected["runnable"]]
+    assert len(runnable) == 9
+    assert len(blocked) == 3
+
+
+def test_validation_timeout_label_cannot_change_the_runtime_verdict(
+    tmp_path,
+) -> None:
+    wrong_label = {
+        "extraction_status": "supported",
+        "facts": {},
+        "warning_codes": [],
+        "runnable": True,
+        "execution_expected": True,
+        "verdict": "not_reproduced",
+        "side_effects": 1,
+    }
+    case = write_case(
+        tmp_path,
+        "validation",
+        "val-wrong-timeout-label",
+        "timeout.py",
+        TIMEOUT_SOURCE,
+        "client-timeout",
+        {**wrong_label},
+    )
+    case["inputs"] = {
+        "server_idempotency": "off",
+        "timeout_mode": "client_first_then_commit",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0,
+    }
+    write_dataset(tmp_path, [], [], validation_cases=[case])
+
+    report = run_benchmark(tmp_path)
+    result = report["splits"]["validation"]["cases"][0]
+
+    assert result["actual"]["verdict"] == "confirmed"
+    assert result["matched"] is False
+    assert "verdict" in result["mismatches"]

@@ -153,6 +153,45 @@ def build_deterministic_explanation(report: dict[str, Any]) -> str:
         "Expected: one logical operation should produce at most one side "
         "effect for a safe client."
     )
+    harness_decisions = [
+        event
+        for event in decisions
+        if (event.get("data") or {}).get("decision_provenance")
+        == "harness_configured"
+    ]
+    if harness_decisions:
+        lines.append(
+            f"{len(harness_decisions)} retry decision(s) were recorded by the "
+            "harness from its configured status policy; they are not evidence "
+            "that the client implemented that policy."
+        )
+    budget = execution.get("retry_budget")
+    if isinstance(budget, dict):
+        lines.append(
+            "Retry budget: "
+            f"{budget.get('outcome')} (observed "
+            f"{budget.get('observed_attempts')} of "
+            f"{budget.get('expected_max_attempts')} permitted attempt(s)); "
+            f"{budget.get('reason')}"
+        )
+    keys = execution.get("idempotency_key")
+    if isinstance(keys, dict):
+        lines.append(
+            "Idempotency key: "
+            f"{keys.get('outcome')} "
+            f"({keys.get('distinct_key_count')} distinct value(s) across "
+            f"{len(keys.get('attempts') or [])} attempt(s)); "
+            f"{keys.get('reason')}"
+        )
+    dedup = execution.get("server_deduplication")
+    if isinstance(dedup, dict):
+        lines.append(
+            "Server deduplication: "
+            f"{'on' if dedup.get('enabled') else 'off'} "
+            f"[{dedup.get('provenance')}"
+            f"{', inferred' if dedup.get('inferred') else ''}], "
+            f"observed replays: {dedup.get('observed_replay_count')}."
+        )
     duplicate = isinstance(side_effects, int) and side_effects > 1
     lines.append(
         "Duplicate side effects observed: "
@@ -324,6 +363,7 @@ def _summary_payload(report: dict[str, Any]) -> dict[str, Any]:
             "observed_side_effects": execution["observed_side_effects"],
             "attempt_ids": execution["attempt_ids"],
             "side_effect_ids": execution["side_effect_ids"],
+            "retry_budget": execution.get("retry_budget"),
             "events": [
                 {
                     "seq": event["seq"],

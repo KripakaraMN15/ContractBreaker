@@ -312,11 +312,16 @@ def _collect_blockers(
         blockers.append("retry triggers do not include a timeout or connection error")
     if present.status not in {FactStatus.KNOWN, FactStatus.ABSENT}:
         blockers.append("idempotency key presence is unresolved")
-    elif present.status is FactStatus.KNOWN:
-        if reused.status is not FactStatus.KNOWN or reused.value is not True:
-            blockers.append(
-                "idempotency key is not known to be reused across retry attempts"
-            )
+    elif present.status is FactStatus.KNOWN and (
+        reused.status is not FactStatus.KNOWN
+    ):
+        # A key that is known to change between attempts is precisely the
+        # behaviour the runtime experiment evaluates, so it must not block
+        # execution. Only an unresolved reuse fact blocks, because the case can
+        # not be described predictably before it runs.
+        blockers.append(
+            "idempotency key reuse across retry attempts is unresolved"
+        )
     blockers.extend(warnings)
     return _dedupe(tuple(blockers))
 

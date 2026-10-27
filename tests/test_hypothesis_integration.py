@@ -169,7 +169,13 @@ httpx.post("http://service.test/payments", timeout=1)
         recommend_scenario(hypothesis)
 
 
-def test_key_generated_inside_loop_is_not_scenario_ready() -> None:
+def test_key_generated_inside_loop_is_scenario_ready() -> None:
+    """A key that changes per attempt is testable, not a readiness blocker.
+
+    Milestone 10 inverted this expectation: refusing to run the one client shape
+    the experiment exists to evaluate made key instability unobservable.
+    """
+
     source = """import uuid
 import requests
 
@@ -189,11 +195,33 @@ for attempt in range(2):
     assert hypothesis.idempotency_key_present.status is FactStatus.KNOWN
     assert hypothesis.idempotency_key_reused.status is FactStatus.KNOWN
     assert hypothesis.idempotency_key_reused.value is False
+    assert hypothesis.scenario_ready is True
+    assert not any("reuse" in blocker for blocker in hypothesis.blockers)
+
+    recommendation = recommend_scenario(hypothesis)
+    assert recommendation.client_sends_idempotency_key is True
+    assert recommendation.max_retries == 1
+
+
+def test_unresolved_key_reuse_still_blocks_execution() -> None:
+    source = """import requests
+for attempt in range(2):
+    key = make_key()
+    try:
+        requests.post(
+            "http://service.test/payments",
+            headers={"Idempotency-Key": key},
+            timeout=5,
+        )
+    except requests.exceptions.Timeout:
+        continue
+"""
+    hypothesis = hypothesize_from_source(source)
+
+    assert hypothesis.idempotency_key_present.status is FactStatus.KNOWN
+    assert hypothesis.idempotency_key_reused.status is FactStatus.UNKNOWN
     assert hypothesis.scenario_ready is False
-    assert any(
-        "reused across retry attempts" in blocker
-        for blocker in hypothesis.blockers
-    )
+    assert any("reuse" in blocker for blocker in hypothesis.blockers)
 
     with pytest.raises(HypothesisNotRunnable):
         recommend_scenario(hypothesis)

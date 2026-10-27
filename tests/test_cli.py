@@ -499,6 +499,11 @@ def test_report_schema_is_stable_and_json_native(tmp_path, capsys) -> None:
         "operation_ids",
         "side_effect_ids",
         "observed_side_effects",
+        "retry_budget",
+        "idempotency_key",
+        "server_deduplication",
+        "timeout",
+        "failure",
     }
     assert report["execution"]["provenance"] == "runtime_observation"
     assert report["extraction"]["provenance"] == "static_extraction"

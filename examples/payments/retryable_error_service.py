@@ -7,6 +7,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 
 from contractbreaker.events import EventKind, EventLog
+from contractbreaker.observations import key_fingerprint
 
 
 def create_retryable_error_payment_app(
@@ -54,7 +55,7 @@ def create_retryable_error_payment_app(
                 EventKind.IDEMPOTENT_REPLAY,
                 attempt_id=attempt_id,
                 operation_id=operation_id,
-                idempotency_key=idempotency_key,
+                idempotency_key_fingerprint=key_fingerprint(idempotency_key),
             )
             return (
                 jsonify(seen_keys[idempotency_key]),

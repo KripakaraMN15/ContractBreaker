@@ -25,7 +25,10 @@ class EventKind(str, Enum):
     RETRY_POLICY_CONFIGURED = "retry_policy_configured"
     RETRYABLE_ERROR_RETURNED = "retryable_error_returned"
     RETRY_SCHEDULED = "retry_scheduled"
+    CLIENT_TIMEOUT_OBSERVED = "client_timeout_observed"
+    SERVER_PROCESSING_COMPLETED = "server_processing_completed"
     SCENARIO_END = "scenario_end"
+
 
 
 @dataclass(frozen=True)

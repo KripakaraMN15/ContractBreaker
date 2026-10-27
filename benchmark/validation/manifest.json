@@ -1,0 +1,316 @@
+{
+  "dataset": "contractbreaker-synthetic",
+  "dataset_version": "1.0",
+  "split": "validation",
+  "description": "Independently authored compatibility fixtures. These are NOT public real-world client code and do not demonstrate generalisation to public clients.",
+  "cases": [
+    {
+      "id": "val-lost-named-bound-buggy",
+      "source": "val_lost_named_bound_buggy.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Independent validation: retry bound supplied through a module-level name rather than a range literal."
+    },
+    {
+      "id": "val-lost-named-bound-fixed",
+      "source": "val_lost_named_bound_fixed.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Independent validation: same client as val-lost-named-bound-buggy plus a stable key, differing only in the reliability behaviour."
+    },
+    {
+      "id": "val-lost-range-start-buggy",
+      "source": "val_lost_range_start_buggy.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Independent validation: two-iteration loop written with an explicit start bound."
+    },
+    {
+      "id": "val-lost-range-start-fixed",
+      "source": "val_lost_range_start_fixed.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Independent validation: matched fixed pair for val-lost-range-start-buggy."
+    },
+    {
+      "id": "val-retry-lax-client-buggy",
+      "source": "val_retry_lax_client_buggy.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 2
+      },
+      "notes": "Independent validation: retryable-error client that never calls raise_for_status, so only the status check drives the retry."
+    },
+    {
+      "id": "val-retry-lax-client-fixed",
+      "source": "val_retry_lax_client_fixed.py",
+      "scenario": "retryable-error",
+      "inputs": {
+        "server_idempotency": "auto",
+        "retry_statuses": [503],
+        "server_error_status": 503,
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Independent validation: matched fixed pair; differs from the buggy client only by the stable idempotency key."
+    },
+    {
+      "id": "val-timeout-keyed-orphan",
+      "source": "val_timeout_keyed_orphan.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "on",
+        "timeout_mode": "client_first_then_commit",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "absent", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "confirmed",
+        "side_effects": 1
+      },
+      "notes": "Independent validation: a keyed single-attempt client still leaves an orphaned commit when the server resumes after the simulated timeout."
+    },
+    {
+      "id": "val-timeout-keyed-aborted",
+      "source": "val_timeout_keyed_aborted.py",
+      "scenario": "client-timeout",
+      "inputs": {
+        "server_idempotency": "on",
+        "timeout_mode": "client_first_no_commit",
+        "timeout_invariant": "abort-on-timeout",
+        "execution_timeout": 5.0
+      },
+      "expected": {
+        "extraction_status": "partial",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 0},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 0
+      },
+      "notes": "Independent validation: single-iteration loop whose suspended work is aborted, so the timeout leaves no side effect."
+    },
+    {
+      "id": "val-key-derived-stable-fixed",
+      "source": "val_key_derived_stable_fixed.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "known", "value": true},
+          "idempotency_key_reused": {"status": "known", "value": true}
+        },
+        "warning_codes": [],
+        "runnable": true,
+        "execution_expected": true,
+        "verdict": "not_reproduced",
+        "side_effects": 1
+      },
+      "notes": "Independent validation: correctly implemented client whose key is derived with base64 rather than uuid. Reclassified from an unsupported probe after measurement showed it is statically resolvable, stable, and safe."
+    },
+    {
+      "id": "val-unsupported-http-client",
+      "source": "val_unsupported_http_client.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "no_http_calls",
+        "facts": {
+          "method": {"status": "absent", "value": null},
+          "endpoint": {"status": "absent", "value": null},
+          "timeout": {"status": "absent", "value": null},
+          "retry_count": {"status": "absent", "value": null},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "unknown", "value": null},
+          "idempotency_key_reused": {"status": "unknown", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Unsupported probe: stdlib http.client instead of requests. Must be blocked, never executed."
+    },
+    {
+      "id": "val-unsupported-import",
+      "source": "val_unsupported_import.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "known", "value": "POST"},
+          "endpoint": {"status": "known", "value": "http://service.test/payments"},
+          "timeout": {"status": "known", "value": 4},
+          "retry_count": {"status": "known", "value": 1},
+          "retry_triggers": {"status": "known", "value": ["requests.exceptions.Timeout"]},
+          "idempotency_key_present": {"status": "absent", "value": null},
+          "idempotency_key_reused": {"status": "absent", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Unsupported probe: extraction succeeds but the import allowlist blocks execution."
+    },
+    {
+      "id": "val-unsupported-two-calls",
+      "source": "val_unsupported_two_calls.py",
+      "scenario": "lost-response",
+      "inputs": {"server_idempotency": "auto", "execution_timeout": 5.0},
+      "expected": {
+        "extraction_status": "supported",
+        "facts": {
+          "method": {"status": "ambiguous", "value": null},
+          "endpoint": {"status": "ambiguous", "value": null},
+          "timeout": {"status": "ambiguous", "value": null},
+          "retry_count": {"status": "ambiguous", "value": null},
+          "retry_triggers": {"status": "unknown", "value": null},
+          "idempotency_key_present": {"status": "unknown", "value": null},
+          "idempotency_key_reused": {"status": "unknown", "value": null}
+        },
+        "warning_codes": [],
+        "runnable": false,
+        "execution_expected": false,
+        "verdict": "inconclusive",
+        "side_effects": null
+      },
+      "notes": "Unsupported probe: two recognized call sites. Blocked because the harness can not attribute side effects to one operation."
+    }
+  ]
+}

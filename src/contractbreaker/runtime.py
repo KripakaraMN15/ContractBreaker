@@ -16,6 +16,15 @@ class RuntimeExecutionError(RuntimeError):
     """Raised when the isolated client execution can not be trusted."""
 
 
+class RuntimeExecutionTimeout(RuntimeExecutionError):
+    """Raised when the harness killed the worker before it produced a result.
+
+    This is an execution-control timeout owned by the harness. It is structurally
+    separate from a client-timeout scenario event, which models what the analyzed
+    client observed.
+    """
+
+
 @dataclass(frozen=True)
 class RuntimeRunResult:
     """Observed events and side-effect count from the worker."""
@@ -32,6 +41,10 @@ def run_analyzed_client(
     retry_statuses: tuple[int, ...] = (),
     server_error_status: int = 503,
     policy_max_retries: int = 1,
+    policy_max_attempts: int | None = None,
+    timeout_mode: str | None = None,
+    declared_timeout_seconds: float | None = None,
+    declared_timeout_source: str | None = None,
     execution_timeout_seconds: float = 10.0,
 ) -> RuntimeRunResult:
     """Run the analyzed module in a subprocess and read its event trace."""
@@ -55,6 +68,18 @@ def run_analyzed_client(
             "--policy-max-retries",
             str(policy_max_retries),
         ]
+        if policy_max_attempts is not None:
+            command.extend(["--policy-max-attempts", str(policy_max_attempts)])
+        if timeout_mode is not None:
+            command.extend(["--timeout-mode", timeout_mode])
+        if declared_timeout_seconds is not None:
+            command.extend(
+                ["--declared-timeout", str(declared_timeout_seconds)]
+            )
+        if declared_timeout_source is not None:
+            command.extend(
+                ["--declared-timeout-source", declared_timeout_source]
+            )
         if server_supports_idempotency:
             command.append("--server-idempotency")
         for status in retry_statuses:
@@ -71,7 +96,7 @@ def run_analyzed_client(
                 check=False,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeExecutionError(
+            raise RuntimeExecutionTimeout(
                 f"runtime execution timed out after "
                 f"{execution_timeout_seconds:.1f}s"
             ) from exc

@@ -1,16 +1,18 @@
 import requests
 
 
-def send_payment():
+def submit_payment(amount_cents):
+    """Retry helper deliberately kept out of module scope."""
     for attempt in range(2):
         try:
-            requests.post(
+            return requests.post(
                 "http://service.test/payments",
-                json={"amount_cents": 1999},
+                json={"amount_cents": amount_cents},
                 timeout=5,
             )
         except requests.exceptions.Timeout:
             continue
+    return None
 
 
-send_payment()
+submit_payment(4200)

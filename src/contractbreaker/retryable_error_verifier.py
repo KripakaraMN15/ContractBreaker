@@ -2,9 +2,17 @@
 
 This is a distinct scenario from the lost-response case. The server commits,
 returns an HTTP error selected by an explicitly configured client retry policy,
-and the client retries only after recording a retry decision for that error.
-A duplicate is confirmed only when the full ordered chain proves all three
-conditions.
+and the client retries only after a ``retry_scheduled`` event is recorded for
+that error. A duplicate is confirmed only when the full ordered chain proves all
+three conditions.
+
+Provenance matters here. The analysed-client runtime synthesises
+``retry_scheduled`` from its own configured status policy plus the arrival of a
+later request, and stamps it ``harness_configured``. Such a decision is evidence
+that a retry happened after a status the harness declared retryable; it is not
+evidence that the client implemented the correct policy. The policy comparison
+below is therefore best read as *declared-policy consistency*, not as
+independent proof of client behaviour.
 """
 
 from __future__ import annotations
@@ -257,9 +265,12 @@ def verify_retryable_error_duplicate(
         statuses = _status_set(event.data.get("retry_statuses"))
         if statuses is None:
             return fail(f"retry decision for {attempt} has invalid configured statuses")
+        # Declared-policy consistency only: both sides originate from the same
+        # declared status set, so this can not prove client-side policy.
         if statuses != policy_statuses:
             return fail(
-                f"retry decision for {attempt} does not match the configured policy"
+                f"retry decision for {attempt} does not match the declared "
+                "retry policy"
             )
         status = event.data.get("status_code")
         if not _is_int(status) or status not in policy_statuses:
@@ -392,11 +403,18 @@ def verify_retryable_error_duplicate(
             return fail("another request occurred between the retry and its commit")
         if side_effects < 2:
             return fail("second commit is present but fewer than two side effects exist")
+        decision_note = (
+            " (retry decision recorded by the harness, not the client)"
+            if initial_decision.data.get("decision_provenance")
+            == "harness_configured"
+            else ""
+        )
         return _result(
             Verdict.CONFIRMED,
             (
-                "retry of an explicitly configured retryable error "
+                "retry of a declared retryable error "
                 f"committed a second side effect ({side_effects} side effects)"
+                f"{decision_note}"
             ),
             side_effects,
             trace,
