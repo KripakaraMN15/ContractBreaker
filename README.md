@@ -461,6 +461,13 @@ contractbreaker dashboard --root path/to/project --port 8765
 # Then open http://127.0.0.1:8765
 ```
 
+**Local use only. Do not expose it publicly.** The dashboard has no
+authentication, keeps approvals in memory, and executes the analyzed client in
+a subprocess with your user privileges. Keep it bound to loopback and do not
+put it behind a public proxy or bind it to a public interface. The worker is
+constrained (allowlisted imports, blocked socket construction, bounded
+execution timeout) but it is **not** a hardened OS-level sandbox.
+
 Environment variables:
 
 - `OPENAI_API_KEY` ? optional. Enables the server-side LLM fallback. The
@@ -871,6 +878,18 @@ Deterministic analysis needs only the base dependencies. For the optional LLM
 fallback, install the `llm` extra and set `OPENAI_API_KEY` and optionally
 `CONTRACTBREAKER_LLM_MODEL`; see `.env.example`.
 
+### Quick start (fresh clone)
+
+```bash
+git clone https://github.com/KripakaraMN15/ContractBreaker.git
+cd ContractBreaker
+python -m pip install -e ".[dev]"
+python -m contractbreaker benchmark --dataset benchmark
+```
+
+The benchmark exits `0` only when every labeled case matches and the evidence
+integrity suite passes; any mismatch or error exits non-zero.
+
 ### Windows PowerShell
 
 ```powershell
@@ -898,8 +917,11 @@ worker works outside the repository root.
 
 ## Tests
 
-The complete suite currently collects 161 tests: 160 pass and the optional paid
-live OpenAI smoke test is skipped by default.
+The complete suite currently collects 321 tests: 319 pass, and two are skipped
+by default. The skipped cases are the optional paid live OpenAI smoke test and,
+where the platform does not permit creating symbolic links, the symlink
+containment test (a directory-junction equivalent runs on Windows instead; on
+Linux CI the symlink test runs).
 
 `tests/test_duplicate_side_effects.py` covers the strict causal verifier:
 

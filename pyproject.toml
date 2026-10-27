@@ -1,12 +1,15 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "contractbreaker"
 version = "0.1.0"
 description = "Deterministic causal verification of retry/timeout conflicts"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["requests>=2.31", "flask>=3.0"]
 
 [project.optional-dependencies]
@@ -15,6 +18,11 @@ llm = ["openai>=1.40"]
 
 [project.scripts]
 contractbreaker = "contractbreaker.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/KripakaraMN15/ContractBreaker"
+Repository = "https://github.com/KripakaraMN15/ContractBreaker"
+Issues = "https://github.com/KripakaraMN15/ContractBreaker/issues"
 
 [tool.setuptools.packages.find]
 where = ["src", "."]
