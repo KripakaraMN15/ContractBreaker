@@ -1,74 +1,236 @@
 # ContractBreaker
 
-Deterministic detection of retry/timeout conflicts between an HTTP client and a
-service, backed by a causal event trace rather than a pass/fail assertion.
+**One logical payment should produce one side effect. ContractBreaker proves when a retry produces two.**
 
-> Status: milestone 6B. Deterministic extraction, runtime execution, and
-> benchmark scoring remain the baseline. An opt-in OpenAI fallback may propose
-> unresolved facts, but every accepted fact requires validated source evidence
-> and the existing runtime gates and verifier remain authoritative. Benchmark
-> results are synthetic and do not establish general production accuracy.
+[![CI](https://github.com/KripakaraMN15/ContractBreaker/actions/workflows/ci.yml/badge.svg)](https://github.com/KripakaraMN15/ContractBreaker/actions/workflows/ci.yml)
+
+ContractBreaker is a focused reliability-testing tool for Python HTTP clients.
+It reads one client, forms a testable retry/timeout hypothesis, injects a
+controlled failure into a local in-process service, runs the real client in a
+subprocess, and lets a deterministic causal verifier decide whether a duplicate
+side effect actually happened. Every verdict ships with the event trace that
+produced it.
+
+It is not a linter and not a general bug scanner. It answers one narrow
+question well: *given this client, this failure, and this server behaviour, does
+one logical operation commit twice?*
 
 ## The problem
 
-Each side can be correct in isolation and still fail together. A client retries
-after a timeout; the server had already committed the first request. The result
-is a duplicate side effect, such as a double charge. Types, schemas, and unit
-tests can all pass while this happens.
+Two components can each be correct and still fail together. A client times out,
+assumes the request failed, and retries. The server had already committed the
+first one.
 
-## How it works
-
-1. The CLI reads one supported Python client file and extracts retry, timeout,
-   and idempotency facts.
-2. It builds a deterministic hypothesis. If `--llm-fallback` is enabled,
-   unresolved facts may be proposed by OpenAI, validated against exact source
-   evidence, and conservatively merged before the hypothesis is rebuilt.
-3. It checks both scenario readiness and the narrow executable-client contract.
-4. If runnable, a subprocess worker executes the analyzed module against an
-   in-process Flask test service. All `requests` traffic is routed through the
-   harness adapter, socket construction is blocked, and the parent enforces an
-   execution timeout.
-5. The selected scenario simulates either a lost response after a server commit
-   or a configured retryable HTTP error after a commit.
-6. An append-only event log records requests, server receipt, commits, faults,
-   replays, and the terminal outcome with explicit attempt ids.
-7. The existing verifier checks the ordered causal chain and reconciles commits
-   with the observable side-effect ledger.
-8. `contractbreaker benchmark` runs labeled development and held-out datasets
-   through the same pipeline and scores extraction, runnability, and runtime
-   verification separately, optionally with LLM assistance.
-
-Deterministic analysis makes no external network or LLM calls. The opt-in LLM
-fallback makes an OpenAI request only when explicitly enabled and unresolved
-facts exist. Faults are deterministic. UUIDs identify operations and keys, but
-they do not affect the verdict logic. The bundled reference scenarios remain as
-programmatic verifier fixtures; the CLI does not silently substitute them for
-the analyzed source.
-
-## Strict verdict rules
-
-A bug is `confirmed` only when the trace proves this chain:
-
-```text
-initial request (attempt N)
-  -> initial side-effect commit (attempt N)
-  -> dropped response (attempt N)
-  -> retry request (attempt M, same operation id, M != N)
-  -> second side-effect commit (attempt M)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Payment service
+    C->>S: POST /payments (no idempotency key)
+    S->>S: commit charge 1
+    S--xC: response lost (timeout)
+    Note over C: client assumes the payment failed
+    C->>S: retry POST /payments
+    S->>S: commit charge 2
+    Note over C,S: one payment, two charges
 ```
 
-Every relevant event must carry a matching attempt id, sequence numbers must be
-strictly increasing, side-effect ids must be distinct, and the committed count
-must equal the observed ledger count.
+Types, schemas, and unit tests can all pass while this happens. What is missing
+is not another test of either component in isolation — it is a test of the
+*interaction*, under a failure the client is expected to retry.
+
+## What ContractBreaker does
+
+```mermaid
+flowchart LR
+    A[Analyze one client file] --> B[Hypothesis and readiness]
+    B --> C{Runnable?}
+    C -- no --> D[Blocked with concrete blockers]
+    C -- yes --> E[Plan artifact]
+    E --> F[Human approves that plan]
+    F --> G[Client runs in a subprocess]
+    G --> H[In-process service injects the fault]
+    H --> I[Causal verifier reads the trace]
+    I --> J[Verdict plus evidence]
+```
+
+| Stage | What happens | What it produces |
+| --- | --- | --- |
+| Analyze | A conservative AST extractor reads retry, timeout, and idempotency facts from one file. | Facts with per-fact provenance, plus warnings for unsupported patterns. |
+| Hypothesize | Facts become a scenario (`lost-response`, `retryable-error`, `client-timeout`) with explicit blockers. | `runnable` or blockers — never a guess. |
+| Approve | A plan artifact binds the resolved source hash, scenario, options, and allowed root. | Altered or stale plans are rejected. |
+| Execute | The client runs in a subprocess against an in-process Flask service; sockets are blocked. | An ordered event trace with attempt and operation ids. |
+| Verify | The causal verifier checks ordering, correlation, and the side-effect ledger. | `confirmed`, `not_reproduced`, or `inconclusive`. |
+| Explain | A deterministic explanation is built from the report. | Evidence, blockers, and limitations — no model opinion. |
+
+Deterministic analysis makes no network or LLM calls. The optional OpenAI
+fallback is off by default and can only propose facts that are validated against
+exact source evidence; it never sets a verdict.
+
+## How the evidence is verified
+
+A verdict is never inferred from how the code "looks". It is derived from the
+ordered trace:
+
+```text
+request_sent(attempt N) -> request_received -> side_effect_committed(N)
+  -> response_dropped -> request_sent(attempt M, same operation)
+  -> side_effect_committed(M)
+```
+
+Every relevant event must carry the attempt it belongs to, all events must share
+one logical operation, sequence numbers must increase, side-effect ids must be
+distinct, and the commits must reconcile with the observable ledger. Anything
+missing, reordered, or contradictory is `inconclusive` — never `confirmed`.
 
 | Verdict | Meaning |
 | --- | --- |
 | `confirmed` | The complete causal chain exists and the duplicate is observable. |
-| `not_reproduced` | The scenario ran, but either no retry happened or the retry was deduplicated. |
-| `inconclusive` | Evidence is empty, incomplete, malformed, out of order, or contradictory. |
+| `not_reproduced` | The scenario ran and the failure was not demonstrated under these conditions. |
+| `inconclusive` | The evidence is incomplete, contradictory, or the scenario could not run. |
 
-A passing scenario is evidence about this scenario only. It is **not** proof of
-general production safety.
+A verdict is evidence about one scenario under one injected fault. It is **not**
+a proof of production safety.
+
+## Before and after: what the fix changes
+
+These two clients are the same retry loop. The only difference is where the
+idempotency key is created.
+
+```python
+# retry-unsafe: key never sent  ->  confirmed, 2 side effects
+import requests
+
+for attempt in range(2):
+    try:
+        requests.post(
+            "http://service.test/payments",
+            json={"amount_cents": 1999},
+            timeout=5,
+        )
+    except requests.exceptions.Timeout:
+        continue
+```
+
+```python
+# retry-safe: one stable key created before the loop  ->  not_reproduced, 1 side effect
+import uuid
+import requests
+
+idempotency_key = str(uuid.uuid4())
+for attempt in range(2):
+    try:
+        requests.post(
+            "http://service.test/payments",
+            headers={"Idempotency-Key": idempotency_key},
+            json={"amount_cents": 1999},
+            timeout=5,
+        )
+    except requests.exceptions.Timeout:
+        continue
+```
+
+| | Unsafe client | Safe client |
+| --- | --- | --- |
+| Idempotency key | none | one stable key, created once |
+| Attempt 1 | commits `effect-1`, response dropped | commits `effect-1`, response dropped |
+| Attempt 2 | commits `effect-2` | `idempotent_replay` — no new commit |
+| Observed side effects | **2** | **1** |
+| Verdict | `confirmed` | `not_reproduced` |
+
+The fix only holds if the server actually enforces deduplication. ContractBreaker
+reports whether server deduplication was asserted (`on`/`off`) or inferred from
+the client's key, so a `not_reproduced` that depends on inference is labelled as
+conditional.
+
+## How it was validated
+
+- **319 tests pass**, 2 skipped by default (the paid live-model smoke test, and a
+  symlink containment test that is skipped where the OS does not permit creating
+  symlinks).
+- **42 labeled benchmark cases**: 20 development, 10 held-out, and 12
+  independently authored validation fixtures.
+- **7 evidence-integrity traces** replayed through the production verifiers. Six
+  are corrupt or contradictory and must stay `inconclusive`; the seventh is a
+  positive control that must stay `confirmed`. The build fails if a corrupt
+  trace is ever confirmed.
+
+| Split | Cases | Buggy detected | False positives | Blocked correctly | Inconclusive |
+| --- | ---: | --- | --- | --- | ---: |
+| Development | 20 | 6/6 | 0/8 | 5/5 | 6 |
+| Held-out | 10 | 1/1 | 0/3 | 6/6 | 6 |
+| Independent validation | 12 | 4/4 | 0/5 | 3/3 | 3 |
+| Evidence integrity | 7 | — | — | — | 6 (1 control confirmed) |
+
+These numbers are regression evidence on a small synthetic dataset. They are not
+a claim about general accuracy, and no public client has been validated. See
+[Benchmark](#benchmark-milestone-6a) and [Known limitations](#known-limitations).
+
+## Install
+
+```bash
+python -m pip install contractbreaker
+```
+
+Python 3.10+ with two runtime dependencies (`requests`, `flask`). The optional
+OpenAI fallback is a separate extra, `pip install "contractbreaker[llm]"`, and
+stays disabled unless `--llm-fallback` is passed.
+
+The benchmark dataset ships with the repository, not the wheel. To run the
+benchmark, the dashboard, or the Alan Skill, clone the repository:
+
+```bash
+git clone https://github.com/KripakaraMN15/ContractBreaker.git
+cd ContractBreaker
+python -m pip install -e ".[dev]"
+python -m contractbreaker benchmark --dataset benchmark
+```
+
+## Run it
+
+Analyze one client. This executes immediately, so only point it at code you
+trust:
+
+```bash
+contractbreaker analyze path/to/client.py --scenario lost-response --format json
+```
+
+Plan, review, then approve. The approval is bound to the plan artifact:
+
+```bash
+contractbreaker workflow \
+  --request "duplicate payment after a lost response" \
+  --source path/to/client.py \
+  --allowed-root . \
+  --plan-only --plan-out plan.json --format json
+
+contractbreaker workflow \
+  --request "duplicate payment after a lost response" \
+  --source path/to/client.py \
+  --allowed-root . \
+  --approve --plan plan.json --format json
+```
+
+Exit codes: `0` not reproduced, `1` confirmed, `2` inconclusive or planned,
+`3` invalid or rejected approval, `4` unsupported input.
+
+## Local dashboard
+
+```bash
+contractbreaker dashboard --root .
+```
+
+**Local use only.** The dashboard has no authentication and executes the
+analyzed client in a subprocess. Keep it on loopback and never expose it
+publicly. See [Dashboard](#dashboard-milestone-8) for its API and safety
+properties.
+
+## Alan integration
+
+ContractBreaker ships a repository-level Alan Skill (`SKILL.md`) that drives this
+CLI. It is a **Skill + local CLI** workflow: there is no Alan API client and no
+MCP server, and `contractbreaker` must be installed in the environment where
+Alan executes. See
+[Using ContractBreaker with Alan](#using-contractbreaker-with-alan).
 
 ## CLI
 
@@ -551,7 +713,8 @@ local `contractbreaker` CLI, so three things must exist in the environment
 where the session runs:
 
 1. **Python 3.10+ and the installed package** —
-   `python -m pip install -e ".[dev]"` from the repository root. Installation
+   `python -m pip install contractbreaker`, or
+   `python -m pip install -e ".[dev]"` from a repository checkout. Installation
    is required, not optional: the CLI launches a subprocess that must be able
    to import `contractbreaker` and `examples`.
 2. **The repository checkout**, so the agent can read `SKILL.md` and the target
@@ -874,11 +1037,14 @@ trace yields `confirmed` under `abort-on-timeout` and `not_reproduced` under
 
 Requires Python 3.10+.
 
-Deterministic analysis needs only the base dependencies. For the optional LLM
-fallback, install the `llm` extra and set `OPENAI_API_KEY` and optionally
-`CONTRACTBREAKER_LLM_MODEL`; see `.env.example`.
+For day-to-day use, install the released package:
 
-### Quick start (fresh clone)
+```bash
+python -m pip install contractbreaker
+```
+
+For development, benchmarking, the dashboard, or the Alan Skill, work from a
+clone:
 
 ```bash
 git clone https://github.com/KripakaraMN15/ContractBreaker.git
@@ -887,10 +1053,12 @@ python -m pip install -e ".[dev]"
 python -m contractbreaker benchmark --dataset benchmark
 ```
 
-The benchmark exits `0` only when every labeled case matches and the evidence
-integrity suite passes; any mismatch or error exits non-zero.
+Deterministic analysis needs only the base dependencies. For the optional LLM
+fallback, install the `llm` extra and set `OPENAI_API_KEY` and optionally
+`CONTRACTBREAKER_LLM_MODEL`; see `.env.example`.
 
 ### Windows PowerShell
+
 
 ```powershell
 python -m venv .venv

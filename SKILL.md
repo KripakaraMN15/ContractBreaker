@@ -43,12 +43,14 @@ scenario execution, or verdict logic, and never infer a verdict yourself.
    install is:
 
    ```bash
-   python -m pip install -e ".[dev]"
+   python -m pip install contractbreaker
    ```
 
-   Use `".[dev,llm]"` only if the user wants the optional LLM extra. Never
-   install, upgrade, or otherwise modify the environment without the user's
-   explicit go-ahead.
+   From a development checkout, `python -m pip install -e ".[dev]"` installs the
+   same package in editable mode and adds the test dependencies. Use
+   `"contractbreaker[llm]"` only if the user wants the optional LLM extra.
+   Never install, upgrade, or otherwise modify the environment without the
+   user's explicit go-ahead.
 
    Installation is required, not optional: the CLI launches a subprocess that
    must be able to import `contractbreaker` and `examples` in that environment.
