@@ -702,6 +702,45 @@ def test_workflow_cli_requires_approval_then_executes(tmp_path, capsys) -> None:
         ]
     )
     captured = capsys.readouterr()
+
+    # Approval without a plan artifact is refused and nothing is executed.
+    assert code == EXIT_INVALID_ARGS
+    assert captured.out == ""
+    assert "--plan" in captured.err
+
+    plan = tmp_path / "plan.json"
+    assert (
+        main(
+            [
+                "workflow",
+                "--request",
+                "check a lost response",
+                "--source",
+                str(source),
+                "--plan-only",
+                "--plan-out",
+                str(plan),
+            ]
+        )
+        == EXIT_INCONCLUSIVE
+    )
+    capsys.readouterr()
+
+    code = main(
+        [
+            "workflow",
+            "--request",
+            "check a lost response",
+            "--source",
+            str(source),
+            "--approve",
+            "--plan",
+            str(plan),
+            "--format",
+            "json",
+        ]
+    )
+    captured = capsys.readouterr()
     executed = json.loads(captured.out)
 
     assert code == EXIT_CONFIRMED
@@ -714,6 +753,24 @@ def test_workflow_cli_requires_approval_then_executes(tmp_path, capsys) -> None:
 
 def test_workflow_cli_text_rendering(tmp_path, capsys) -> None:
     source = write_source(tmp_path, FIXED)
+    plan = tmp_path / "plan.json"
+
+    assert (
+        main(
+            [
+                "workflow",
+                "--request",
+                "check a lost response",
+                "--source",
+                str(source),
+                "--plan-only",
+                "--plan-out",
+                str(plan),
+            ]
+        )
+        == EXIT_INCONCLUSIVE
+    )
+    capsys.readouterr()
 
     code = main(
         [
@@ -723,6 +780,8 @@ def test_workflow_cli_text_rendering(tmp_path, capsys) -> None:
             "--source",
             str(source),
             "--approve",
+            "--plan",
+            str(plan),
         ]
     )
     captured = capsys.readouterr()

@@ -145,6 +145,7 @@ class WorkflowRequest:
     llm_client: LLMClient | None = None
     approved: bool = False
     plan_only: bool = False
+    expected_source_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -357,6 +358,7 @@ def run_workflow(request: WorkflowRequest) -> WorkflowState:
         limitations=outcome.limitations,
         llm_fallback=prepared.llm_diagnostics,
         fact_provenance=prepared.llm_result.fact_provenance,
+        execution_failure=outcome.failure,
     )
     state.report = report
     state.limitations.extend(outcome.limitations)
@@ -736,6 +738,7 @@ def _analysis_options(
         execution_timeout=constraints.get("execution_timeout"),
         llm_fallback=request.llm_fallback,
         llm_client=request.llm_client,
+        expected_source_sha256=request.expected_source_sha256,
     )
 
 

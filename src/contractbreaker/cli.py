@@ -37,9 +37,19 @@ from .report import (
 )
 from .dashboard.server import serve as serve_dashboard
 from .version import __version__
+from .plan import (
+    PlanBindingError,
+    build_plan,
+    load_plan,
+    normalize_constraints,
+    source_digest,
+    verify_plan,
+    write_plan,
+)
 from .workflow import (
     SUPPORTED_WORKFLOW_SCENARIOS,
     WorkflowRequest,
+    WorkflowState,
     render_workflow_text,
     run_workflow,
     workflow_exit_code,
@@ -300,9 +310,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="produce a plan and blockers without executing the client",
     )
     workflow_parser.add_argument(
+        "--plan-out",
+        type=Path,
+        default=None,
+        help=(
+            "write the plan artifact that --approve must later reference "
+            "(requires --plan-only)"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--plan",
+        type=Path,
+        default=None,
+        help=(
+            "plan artifact produced by --plan-only --plan-out; required with "
+            "--approve and bound to the exact reviewed investigation"
+        ),
+    )
+    workflow_parser.add_argument(
+        "--allowed-root",
+        type=Path,
+        default=None,
+        help=(
+            "directory the analyzed source must live under; symlinks and '..' "
+            "are resolved before the check"
+        ),
+    )
+    workflow_parser.add_argument(
         "--approve",
         action="store_true",
-        help="explicitly approve execution of a runnable scenario",
+        help=(
+            "execute a runnable scenario; requires --plan pointing at the "
+            "reviewed plan artifact"
+        ),
     )
     workflow_parser.add_argument(
         "--format",
@@ -497,25 +537,200 @@ def _run_workflow_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return EXIT_INVALID_ARGS
+
+    flag_error = _approval_flag_error(args)
+    if flag_error is not None:
+        print(f"error: {flag_error}", file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    allowed_root: Path | None = None
+    if args.allowed_root is not None:
+        if not args.allowed_root.is_dir():
+            print(
+                f"error: --allowed-root is not a directory: {args.allowed_root}",
+                file=sys.stderr,
+            )
+            return EXIT_INVALID_ARGS
+        allowed_root = args.allowed_root.resolve()
+
+    if args.source is not None:
+        violation = _containment_violation(args.source, allowed_root)
+        if violation is not None:
+            print(f"error: {violation}", file=sys.stderr)
+            return EXIT_UNSUPPORTED_INPUT
+
+    # The approval path and the plan-only path both need the resolved source
+    # before anything executes. This first pass never runs the client.
+    planning = args.approve or args.plan_only
     state = run_workflow(
-        WorkflowRequest(
-            request=args.request,
-            source=args.source,
-            scenario=args.scenario,
-            retry_statuses=(
-                tuple(args.retry_statuses)
-                if args.retry_statuses is not None
-                else None
-            ),
-            server_idempotency=args.server_idempotency,
-            server_error_status=args.server_error_status,
-            execution_timeout=args.execution_timeout,
-            llm_fallback=args.llm_fallback,
-            approved=args.approve,
-            plan_only=args.plan_only,
+        _workflow_request(
+            args,
+            approved=False,
+            plan_only=True if planning else args.plan_only,
         )
     )
 
+    if state.normalized is not None:
+        violation = _containment_violation(state.normalized.source, allowed_root)
+        if violation is not None:
+            print(f"error: {violation}", file=sys.stderr)
+            return EXIT_UNSUPPORTED_INPUT
+
+    if args.plan_out is not None and state.normalized is not None:
+        try:
+            _write_plan_artifact(args.plan_out, state, allowed_root, args)
+        except OSError as exc:
+            print(
+                f"error: could not write plan to {args.plan_out}: {exc}",
+                file=sys.stderr,
+            )
+            return EXIT_UNSUPPORTED_INPUT
+
+    if not args.approve:
+        return _emit_workflow_document(state, args)
+
+    if state.normalized is None:
+        return _emit_workflow_document(state, args)
+
+    approved_digest = source_digest(state.normalized.source)
+    try:
+        plan = load_plan(args.plan)
+        verify_plan(
+            plan,
+            tool_version=__version__,
+            scenario=state.normalized.scenario,
+            source_path=state.normalized.source.resolve(),
+            source_sha256=approved_digest,
+            constraints=_constraints_from_args(args),
+            allowed_root=allowed_root,
+        )
+    except (PlanBindingError, OSError) as exc:
+        print(
+            "error: approval rejected: "
+            f"{exc}. Re-create the plan with --plan-only --plan-out and "
+            "review it again.",
+            file=sys.stderr,
+        )
+        return EXIT_INVALID_ARGS
+
+    # Execute exactly the bytes that were hashed and the scenario that was
+    # verified: the scenario is pinned, so the execution pass can not
+    # re-interpret the request into a different scenario.
+    executed = run_workflow(
+        _workflow_request(
+            args,
+            approved=True,
+            plan_only=False,
+            pin_scenario=state.normalized.scenario,
+            expected_source_sha256=approved_digest,
+        )
+    )
+    return _emit_workflow_document(executed, args)
+
+
+def _approval_flag_error(args: argparse.Namespace) -> str | None:
+    """Reject approval combinations that are not bound to a reviewed plan."""
+
+    if args.plan_out is not None and not args.plan_only:
+        return "--plan-out requires --plan-only"
+    if args.plan is not None and args.plan_only:
+        return "--plan cannot be combined with --plan-only"
+    if args.approve and args.plan is None:
+        return (
+            "--approve requires --plan <file>; create one with "
+            "--plan-only --plan-out <file> and review it before approving"
+        )
+    if args.plan is not None and not args.approve:
+        return "--plan requires --approve"
+    return None
+
+
+def _containment_violation(
+    source: Path, allowed_root: Path | None
+) -> str | None:
+    """Return why a source is outside the permitted root, if it is."""
+
+    if allowed_root is None:
+        return None
+    try:
+        resolved = Path(source).resolve()
+    except OSError as exc:
+        return f"source path could not be resolved: {exc}"
+    if not resolved.is_relative_to(allowed_root):
+        return (
+            "source path is outside the allowed root: "
+            f"{resolved} is not within {allowed_root}"
+        )
+    return None
+
+
+def _constraints_from_args(args: argparse.Namespace) -> dict[str, object]:
+    return normalize_constraints(
+        retry_statuses=(
+            tuple(args.retry_statuses)
+            if args.retry_statuses is not None
+            else None
+        ),
+        server_idempotency=args.server_idempotency,
+        server_error_status=args.server_error_status,
+        execution_timeout=args.execution_timeout,
+        llm_fallback=args.llm_fallback,
+    )
+
+
+def _workflow_request(
+    args: argparse.Namespace,
+    *,
+    approved: bool,
+    plan_only: bool,
+    pin_scenario: str | None = None,
+    expected_source_sha256: str | None = None,
+) -> WorkflowRequest:
+    return WorkflowRequest(
+        request=args.request,
+        source=args.source,
+        scenario=pin_scenario if pin_scenario is not None else args.scenario,
+        retry_statuses=(
+            tuple(args.retry_statuses)
+            if args.retry_statuses is not None
+            else None
+        ),
+        server_idempotency=args.server_idempotency,
+        server_error_status=args.server_error_status,
+        execution_timeout=args.execution_timeout,
+        llm_fallback=args.llm_fallback,
+        approved=approved,
+        plan_only=plan_only,
+        expected_source_sha256=expected_source_sha256,
+    )
+
+
+def _write_plan_artifact(
+    path: Path,
+    state: WorkflowState,
+    allowed_root: Path | None,
+    args: argparse.Namespace,
+) -> None:
+    assert state.normalized is not None
+    readiness = (
+        state.analysis_snapshot["hypothesis"]["scenario_readiness"]
+        if state.analysis_snapshot is not None
+        else {"scenario": None, "runnable": False, "blockers": ["no analysis"]}
+    )
+    plan = build_plan(
+        tool_version=__version__,
+        scenario=state.normalized.scenario,
+        scenario_source=state.normalized.scenario_source,
+        source_path=state.normalized.source.resolve(),
+        source_sha256=source_digest(state.normalized.source),
+        constraints=_constraints_from_args(args),
+        allowed_root=allowed_root,
+        readiness=readiness,
+    )
+    write_plan(path, plan)
+
+
+def _emit_workflow_document(state: WorkflowState, args: argparse.Namespace) -> int:
     document = state.snapshot()
     if args.output is not None:
         try:

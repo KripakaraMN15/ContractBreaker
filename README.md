@@ -537,16 +537,32 @@ readiness, execution, or verification.
 The Skill is for investigating a narrow class of Python retry/timeout bugs that
 can duplicate a side effect. It is not a general repository scanner.
 
-### Opening the repository in Alan
+### Setup and registration
 
-1. Open the repository in an Alan session using a supported execution target:
-   **This computer** (desktop app) or a **Remote** team VM or cloud sandbox
-   with the repository cloned into the selected folder.
-2. Confirm the CLI is installed in that environment:
-   `contractbreaker --version`. The documented install, if needed, is
-   `python -m pip install -e ".[dev]"` from the repository root.
-3. The agent discovers `SKILL.md` from the project folder, or you can invoke it
-   explicitly with `/contractbreaker` in the composer.
+There is no MCP server, SDK, or Alan API integration. The Skill drives the
+local `contractbreaker` CLI, so three things must exist in the environment
+where the session runs:
+
+1. **Python 3.10+ and the installed package** —
+   `python -m pip install -e ".[dev]"` from the repository root. Installation
+   is required, not optional: the CLI launches a subprocess that must be able
+   to import `contractbreaker` and `examples`.
+2. **The repository checkout**, so the agent can read `SKILL.md` and the target
+   client.
+3. **The Skill available to the session**, in one of two verified ways:
+   - the repository is open and the agent reads `SKILL.md` directly;
+   - the session lists `contractbreaker` as an installed skill
+     (for example `/contractbreaker` in the composer).
+
+Automatic discovery of a project-root `SKILL.md` is **not verified** and should
+not be promised. On a Windows developer machine, installed skills live under
+`%LOCALAPPDATA%\Alan\production\skills` as an `installed.json` index plus
+`versions\<id>\SKILL.md`. That index is machine-managed; do not hand-edit it —
+install the skill through Alan.
+
+Verify the build with `contractbreaker workflow --help`: `--plan-out`,
+`--plan`, and `--allowed-root` must be listed, otherwise the installed build is
+stale.
 
 No dashboard, API server, or MCP server is required for this path. Nothing is
 exposed to the network.
@@ -563,9 +579,16 @@ The agent should then run the equivalent of:
 contractbreaker workflow \
   --request "duplicate payment after a lost response" \
   --source path/to/client.py \
+  --allowed-root . \
   --plan-only \
+  --plan-out .contractbreaker-plan.json \
   --format json
 ```
+
+`--allowed-root` confines the analyzed source to that directory. The CLI
+resolves the path first (following symlinks and collapsing `..`) and rejects
+anything outside it with exit code `4`. `--plan-out` writes the plan artifact
+that approval is bound to.
 
 Note that the bundled `examples/payments/client.py` is deliberately a *partial*
 example: its HTTP call sits inside a method and its endpoint, timeout, and
@@ -573,19 +596,51 @@ retry limit are not literals. Planning it therefore reports `blocked` with
 concrete blockers. That is the intended behavior, and a useful demonstration
 of the blocker path.
 
+### Plan-bound approval
+
+`--plan-out` records the investigation that was reviewed: the resolved source
+path and its SHA-256, the scenario, the execution-relevant options
+(`server_idempotency`, `retry_statuses`, `server_error_status`,
+`execution_timeout`, `llm_fallback`), the allowed root, and the tool version —
+all under a SHA-256 digest.
+
+`--approve` **requires** `--plan`. Before anything executes, the CLI:
+
+1. verifies the artifact's digest, so a hand-edited plan is rejected;
+2. re-runs the planning pass without executing, and compares every bound field
+   against the current source and options;
+3. refuses to execute if the source content changed, the scenario or any
+   option differs, the allowed root differs, the tool version differs, or the
+   plan was not runnable.
+
+Rejections exit `3` and print `error: approval rejected: ...`; `--approve`
+without `--plan` is also exit `3`. This binds approval to *state*, not to time:
+a plan stays valid while the source and options are unchanged, and it is not
+one-shot. It is **not authentication** — anyone who can run the CLI can create
+and approve their own plan.
+
+At the execution boundary the runtime reads the source once, checks its SHA-256
+against the approved digest, and writes those exact bytes into the temporary
+runtime directory; the worker executes that copy. A mismatch aborts with
+`execution.failure.kind = "source_mismatch"` before anything runs, so the bytes
+that execute are the bytes that were hashed. The execution pass is also pinned
+to the verified scenario, so it can not re-interpret the request into a
+different one (relevant when `--llm-fallback` is enabled).
+
 ### The workflow
 
-1. **Plan** — the agent runs `--plan-only` and reads
+1. **Plan** — the agent runs `--plan-only --plan-out` and reads
    `analysis_snapshot.hypothesis.scenario_readiness` (`runnable`, `blockers`,
    `unknowns`), the extracted facts with `fact_provenance`, and the extraction
    warnings. No analyzed code runs.
 2. **Explain** — the agent shows the selected scenario, the facts, the
-   blockers, what would execute, and what evidence would be collected.
+   blockers, the resolved source path, the plan digest, what would execute, and
+   what evidence would be collected.
 3. **Explicit approval** — the agent stops and asks for approval of that
-   specific plan. General enthusiasm, an earlier unrelated approval, or a
-   request to *create* the plan is not approval to execute.
+   specific plan artifact. General enthusiasm, an earlier unrelated approval,
+   or a request to *create* the plan is not approval to execute.
 4. **Execute** — only after approval, and only if the plan is runnable, the
-   agent runs `--approve` and reads `analysis.verdict`,
+   agent runs `--approve --plan` and reads `analysis.verdict`,
    `analysis.verdict_reason`, and
    `analysis.execution.observed_side_effects`.
 5. **Report** — the agent separates static extraction facts from runtime
@@ -603,14 +658,21 @@ observed_side_effects: 2
 ### Limitations of this integration
 
 - **Conversational approval is an instruction-level gate, not a security
-  boundary.** It depends on the agent following `SKILL.md`. The dashboard's
-  server-issued approval token is the stronger boundary; use it for untrusted
-  input.
-- The runtime contract is narrow: one module-level `requests` call site,
-  `POST /payments`, allowlisted imports, and a stable or absent idempotency
-  key. Unsupported clients are reported as blocked, not worked around.
-- Subprocess execution is deterministic test isolation, not a hardened
-  security sandbox.
+  boundary.** It depends on the agent following `SKILL.md`. The CLI adds
+  plan-bound approval, which guarantees that what executes matches the artifact
+  that was reviewed, but it is still not authentication: anyone who can run the
+  CLI can mint and approve their own plan.
+- **Source containment is opt-in.** `--allowed-root` is enforced when supplied,
+  after resolving symlinks and `..`. Without it the CLI honours any readable
+  path, so untrusted or automated use must pass it — the Skill always does.
+- **Subprocess execution is constrained, not a hardened sandbox.** The analyzed
+  client runs with the invoking user's privileges. Socket construction is
+  blocked and the AST contract restricts imports and calls, but nothing
+  provides OS-level isolation, and the process can still consume CPU and memory
+  until the execution timeout.
+- **The dashboard has no authentication.** It binds to loopback by default and
+  its approval token is a single-use state boundary for its own API, not an
+  authorization layer. Do not expose it publicly.
 - **End-to-end Alan integration has not been verified in a real session.** The
   Skill and the commands in this section are based on the repository's verified
   CLI behavior, but the Alan-side experience is provisional until a real
@@ -1159,6 +1221,9 @@ model measurement**; it only proposes the locally evidenced timeout for
 | --- | ---: | --- | --- | --- | ---: | --- | --- | --- | --- | ---: |
 | Development | 13 | 13/13 | 12/12 each | 8/5 | 0 | 3/3 | 0/4 | 8/8 | 8/8 | 6 |
 | Held-out | 10 | 10/10 | 9/9 each | 4/6 | 0 | 1/1 | 0/3 | 4/4 | 4/4 | 6 |
+
+This table reflects the milestone-6A development split (13 cases) and was not
+re-run against the current 20-case development split.
 
 The fake pass made 10 fake API calls, proposed one fact, accepted it, and
 recorded no conflicts or invalid-evidence rejections. Token usage was supplied

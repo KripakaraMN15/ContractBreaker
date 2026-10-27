@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -25,6 +26,13 @@ class RuntimeExecutionTimeout(RuntimeExecutionError):
     """
 
 
+class RuntimeSourceMismatch(RuntimeExecutionError):
+    """Raised when the source bytes no longer match the approved digest.
+
+    Nothing was executed: the check happens before the worker starts.
+    """
+
+
 @dataclass(frozen=True)
 class RuntimeRunResult:
     """Observed events and side-effect count from the worker."""
@@ -45,20 +53,43 @@ def run_analyzed_client(
     timeout_mode: str | None = None,
     declared_timeout_seconds: float | None = None,
     declared_timeout_source: str | None = None,
+    expected_source_sha256: str | None = None,
     execution_timeout_seconds: float = 10.0,
 ) -> RuntimeRunResult:
-    """Run the analyzed module in a subprocess and read its event trace."""
+    """Run the analyzed module in a subprocess and read its event trace.
+
+    When ``expected_source_sha256`` is supplied, the source bytes are read once,
+    hashed, and written to the temporary runtime directory. The worker executes
+    that verified copy, so the bytes that ran are the bytes that were hashed.
+    A mismatch raises before anything executes.
+    """
 
     source_path = Path(source).resolve()
     with tempfile.TemporaryDirectory(prefix="contractbreaker-runtime-") as tmp:
         temporary = Path(tmp)
         result_path = temporary / "result.json"
+        executable_path = source_path
+        if expected_source_sha256 is not None:
+            try:
+                source_bytes = source_path.read_bytes()
+            except OSError as exc:
+                raise RuntimeExecutionError(
+                    f"analyzed source could not be read before execution: {exc}"
+                ) from exc
+            actual_digest = hashlib.sha256(source_bytes).hexdigest()
+            if actual_digest != expected_source_sha256:
+                raise RuntimeSourceMismatch(
+                    "analyzed source no longer matches the approved digest; "
+                    "refusing to execute it"
+                )
+            executable_path = temporary / "client.py"
+            executable_path.write_bytes(source_bytes)
         command = [
             sys.executable,
             "-m",
             "contractbreaker.runtime_worker",
             "--source",
-            str(source_path),
+            str(executable_path),
             "--result",
             str(result_path),
             "--scenario",

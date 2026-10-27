@@ -29,6 +29,7 @@ from .retryable_error_verifier import verify_retryable_error_duplicate
 from .runtime import (
     RuntimeExecutionError,
     RuntimeExecutionTimeout,
+    RuntimeSourceMismatch,
     run_analyzed_client,
 )
 from .runtime_contract import RuntimeContract, check_runtime_contract
@@ -79,6 +80,7 @@ class AnalysisOptions:
     llm_client: LLMClient | None = None
     timeout_mode: str | None = None
     timeout_invariant: str | None = None
+    expected_source_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -309,7 +311,11 @@ def execute_prepared(prepared: PreparedAnalysis) -> ExecutionOutcome:
             "kind": (
                 "harness_timeout"
                 if isinstance(exc, RuntimeExecutionTimeout)
-                else "worker_error"
+                else (
+                    "source_mismatch"
+                    if isinstance(exc, RuntimeSourceMismatch)
+                    else "worker_error"
+                )
             ),
             "message": str(exc),
         }
@@ -720,6 +726,7 @@ def _execute_lost_response(
         policy_max_attempts=(
             max_attempts if isinstance(max_attempts, int) else None
         ),
+        expected_source_sha256=options.expected_source_sha256,
         execution_timeout_seconds=execution_timeout,
     )
     verified = verify_duplicate_side_effects(
@@ -829,6 +836,7 @@ def _execute_retryable_error(
         retry_statuses=retry_statuses,
         server_error_status=server_error_status,
         policy_max_retries=retry_count,
+        expected_source_sha256=options.expected_source_sha256,
         execution_timeout_seconds=execution_timeout,
     )
     verified = verify_retryable_error_duplicate(
@@ -985,6 +993,7 @@ def _execute_client_timeout(
         timeout_mode=settings.timeout_mode,
         declared_timeout_seconds=float(timeout),
         declared_timeout_source="derived_from_extraction",
+        expected_source_sha256=options.expected_source_sha256,
         execution_timeout_seconds=settings.execution_timeout,
     )
     verified = verify_client_timeout(

@@ -29,16 +29,16 @@ scenario execution, or verdict logic, and never infer a verdict yourself.
 
 ## Preflight
 
-1. Confirm you are in the ContractBreaker repository and that Python is
+1. Confirm you are in the ContractBreaker repository and that Python 3.10+ is
    available.
-2. Check the CLI is installed:
+2. Check the CLI is installed **in the environment Alan will execute in**:
 
    ```bash
    contractbreaker --version
    ```
 
    If that command is missing, `python -m contractbreaker --version` should
-   work from the repository root. If neither works, the package is not
+   work inside an installed environment. If neither works, the package is not
    installed. **Ask the user before installing anything.** The documented
    install is:
 
@@ -49,29 +49,62 @@ scenario execution, or verdict logic, and never infer a verdict yourself.
    Use `".[dev,llm]"` only if the user wants the optional LLM extra. Never
    install, upgrade, or otherwise modify the environment without the user's
    explicit go-ahead.
-3. Identify the **target source file** (a single `.py` client) and the
+
+   Installation is required, not optional: the CLI launches a subprocess that
+   must be able to import `contractbreaker` and `examples` in that environment.
+   If `--plan-out`, `--plan`, or `--allowed-root` are missing from
+   `contractbreaker workflow --help`, the installed build is stale.
+3. Make sure this Skill is available to the session. Two verified situations:
+
+   - **The repository is open in the session and `SKILL.md` is readable** -
+     follow this file directly. This is the path the repository documents and
+     the one used while developing it.
+   - **The session lists `contractbreaker` as an installed skill** - for
+     example `/contractbreaker` in the composer. Use it.
+
+   Do **not** claim that Alan discovers this file automatically. Automatic
+   discovery from a project folder is **not verified**. If the skill is not
+   listed and you cannot read `SKILL.md`, say so instead of improvising.
+   On a developer Windows machine, installed skills live under
+   `%LOCALAPPDATA%\Alan\production\skills` as an `installed.json` index plus
+   `versions\<id>\SKILL.md`. That index is machine-managed: do not hand-edit
+   it, and do not copy files into `versions\` by hand. Install the skill
+   through Alan instead.
+4. Identify the **target source file** (a single `.py` client) and the
    **requested scenario**. If the user names a scenario, use it. Otherwise
    let the workflow interpret the request; do not pick a scenario yourself.
-4. Check the target against the runtime contract. If it is clearly outside it
+5. Check the target against the runtime contract. If it is clearly outside it
    (for example a `httpx` client, a call inside a function or class, a
    non-`POST` request, or a URL path other than `/payments`), say so plainly
    instead of promising an execution.
 
 ## Plan first
 
-Always plan before executing. Plan-only mode never runs the analyzed code:
+Always plan before executing. Plan-only mode never runs the analyzed code, and
+`--plan-out` writes the artifact that approval will be bound to:
 
 ```bash
 contractbreaker workflow \
   --request "duplicate payment after a lost response" \
   --source path/to/client.py \
+  --allowed-root . \
   --plan-only \
+  --plan-out .contractbreaker-plan.json \
   --format json
 ```
 
 Add `--scenario lost-response` or `--scenario retryable-error` to pin the
 scenario. `--request` may be omitted only when both `--scenario` and
 `--source` are given.
+
+`--allowed-root` confines the analyzed source to that directory. The CLI
+resolves the path first (following symlinks and collapsing `..`) and refuses
+anything outside it. Pass the project directory; do not widen it to `/` or
+`C:\` just to make a path work.
+
+`--plan-out` records the exact investigation: the resolved source path and its
+SHA-256, the scenario, the execution-relevant options, the allowed root and the
+tool version, under a digest. Keep that file; approval must reference it.
 
 Exit code `2` with `"outcome": "planned"` is the **expected** result of a
 successful plan. It is not an error.
@@ -115,39 +148,62 @@ switch scenario to force a run, and do not execute.
 
 Only when the plan reports `runnable: true`:
 
-1. Show the proposed investigation: scenario, target file, extracted facts,
-   the fault that will be injected, and the constraints in effect.
+1. Show the proposed investigation: the resolved source path, the scenario, the
+   extracted facts, the fault that will be injected, the constraints in
+   effect, and the plan artifact's digest from its `binding.digest` field.
 2. State the execution consequences plainly: the analyzed client will be
    executed in a subprocess, a side effect may be committed twice, and the
    result is a runtime verdict, not a lint result.
-3. **Ask for explicit approval of that specific plan.** Stop and wait.
+3. **Ask for explicit approval of that specific plan artifact.** Stop and wait.
 
 Approval rules:
 
 - Approval must refer to the plan you just displayed. General enthusiasm, a
   request to "create the plan", or approval given for an earlier unrelated
   investigation is **not** approval to execute.
-- If the source file, scenario, or constraints change after approval, the
-  approval is void. Produce a new plan and ask again.
-- Use the CLI's own approval mechanism: the `--approve` flag. Do not work
-  around it, and do not run the approved command speculatively.
+- Approval is bound to the artifact. The CLI records the resolved source path
+  and its SHA-256, the scenario, the execution-relevant options, the allowed
+  root and the tool version. If any of those change, the CLI rejects the
+  approval and you must re-plan and ask again.
+- Always pass `--plan`; `--approve` without it is rejected with exit code `3`.
+  Do not work around a rejected approval by editing the plan file, dropping
+  `--allowed-root`, or re-running without `--plan`.
 
-Be honest about the strength of this gate: **conversational approval is an
-instruction-level boundary, not a security boundary.** It relies on the agent
-following this skill. The `contractbreaker dashboard` enforces a stronger
-server-issued approval token, and is the better surface for untrusted input.
+Be honest about the strength of this gate. **Conversational approval is still
+an instruction-level boundary**: it relies on the agent following this skill.
+The plan binding is a *tooling* control - the execution boundary re-reads the
+source once, checks its SHA-256 against the approved digest, and runs a
+temporary copy of exactly those bytes. A mismatch aborts before the client
+runs, and the execution pass is pinned to the verified scenario. It is not
+authentication: anyone who can run the CLI can create and approve their own
+plan. The dashboard's server-issued, single-use approval token is a stronger
+state boundary for its own API, but the dashboard has no authentication either,
+so it must not be exposed publicly.
 
 ## Execute and report
 
-Only after the user explicitly approved the displayed plan:
+Only after the user explicitly approved the displayed plan, re-run the **same**
+invocation with the plan artifact:
 
 ```bash
 contractbreaker workflow \
   --request "duplicate payment after a lost response" \
   --source path/to/client.py \
+  --allowed-root . \
   --approve \
+  --plan .contractbreaker-plan.json \
   --format json
 ```
+
+The source, scenario, options and `--allowed-root` must match the planning
+run. Exit code `3` with `error: approval rejected: ...` means the plan is
+stale or was altered: re-plan, show the new plan, and ask again. Do not edit
+the plan file and do not remove the flags that made it fail.
+
+Before the client runs, the runtime re-checks the source digest and executes a
+verified copy written to a temporary directory. If it reports
+`source_mismatch` (or a "no longer matches the approved digest" blocker),
+nothing was executed: re-plan against the current file and ask again.
 
 Read the actual result. The verdict lives in the nested `analysis` object:
 

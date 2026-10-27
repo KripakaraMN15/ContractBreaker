@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -245,3 +247,85 @@ def test_runtime_execution_timeout_maps_to_error(monkeypatch, tmp_path) -> None:
             server_supports_idempotency=False,
             execution_timeout_seconds=1.0,
         )
+
+# --- approved-digest boundary ---------------------------------------------
+
+
+def _capture_worker_command(monkeypatch):
+    captured = {}
+
+    class Completed:
+        returncode = 0
+        stderr = ""
+
+    def fake_run(command, **kwargs):
+        command = list(command)
+        captured["command"] = command
+        source_path = Path(command[command.index("--source") + 1])
+        result_path = Path(command[command.index("--result") + 1])
+        captured["source_path"] = source_path
+        captured["source_bytes"] = source_path.read_bytes()
+        result_path.write_text(
+            json.dumps(
+                {
+                    "events": [],
+                    "observed_side_effects": 0,
+                    "worker_error": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return Completed()
+
+    monkeypatch.setattr("contractbreaker.runtime.subprocess.run", fake_run)
+    return captured
+
+
+def test_expected_digest_mismatch_is_rejected(tmp_path) -> None:
+    source = tmp_path / "client.py"
+    source.write_text(LOST_BUGGY, encoding="utf-8")
+
+    with pytest.raises(RuntimeExecutionError, match="approved digest"):
+        run_analyzed_client(
+            source=source,
+            scenario="lost-response",
+            server_supports_idempotency=False,
+            expected_source_sha256="0" * 64,
+        )
+
+
+def test_worker_executes_the_temporary_verified_copy(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "client.py"
+    source.write_bytes(LOST_BUGGY.encode("utf-8"))
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    captured = _capture_worker_command(monkeypatch)
+
+    run_analyzed_client(
+        source=source,
+        scenario="lost-response",
+        server_supports_idempotency=False,
+        expected_source_sha256=digest,
+    )
+
+    assert captured["source_path"] != source.resolve()
+    assert captured["source_path"].name == "client.py"
+    assert captured["source_bytes"] == LOST_BUGGY.encode("utf-8")
+    assert str(source.resolve()) not in captured["command"]
+
+
+def test_worker_receives_the_original_path_without_a_digest(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "client.py"
+    source.write_bytes(LOST_BUGGY.encode("utf-8"))
+    captured = _capture_worker_command(monkeypatch)
+
+    run_analyzed_client(
+        source=source,
+        scenario="lost-response",
+        server_supports_idempotency=False,
+    )
+
+    assert captured["source_path"] == source.resolve()
